@@ -36,7 +36,7 @@ def run_command(
         cwd: Working directory for the command. Defaults to /home/ted.
         timeout: Max seconds to wait before killing the process (default 30).
     """
-    working_dir = cwd or "/home/ted"
+    working_dir = cwd or str(Path.home())
     try:
         result = subprocess.run(
             ["bash", "-c", command],
