@@ -1,3 +1,7 @@
+---
+tier: baseline
+---
+
 # AGENTS.md — homelab-ops-mcp
 
 MCP server that gives AI agents shell access, file read/write, and process inspection on a local host. Built with FastMCP, deployed in Docker, served over streamable HTTP.
