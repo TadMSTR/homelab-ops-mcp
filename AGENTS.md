@@ -4,7 +4,7 @@ MCP server that gives AI agents shell access, file read/write, and process inspe
 
 ## What it does
 
-Exposes five tools:
+Exposes six tools:
 
 - **`run_command`** — executes arbitrary shell commands via `bash -c`, returns stdout/stderr/exit code
 - **`read_file`** — reads a file with optional line range
@@ -16,17 +16,35 @@ Exposes five tools:
 ## Structure
 
 ```
-server.py    # All server logic — FastMCP app, all tool definitions
+src/homelab_ops_mcp/
+├── __init__.py   # Package version
+├── logging.py    # structlog JSON logging (LOG_LEVEL / LOG_FILE)
+└── server.py     # FastMCP app, all tool definitions, main() entry point
+server.py         # Root shim → homelab_ops_mcp.server:main (backward-compat)
+tests/            # pytest suite (~96% coverage)
 ```
 
-Single-file server. No routes directory, no config file — all settings via CLI args or environment.
+All settings come from CLI args (`--host`, `--port`, `--path`) or the logging env
+vars — no config file. See `ARCHITECTURE.md` for detail.
 
 ## Running locally
 
 ```bash
-pip install fastmcp psutil
+pip install -e ".[dev]"
+homelab-ops-mcp --host 0.0.0.0 --port 8282 --path /mcp
+# or the backward-compatible shim:
 python server.py --host 0.0.0.0 --port 8282 --path /mcp
 ```
+
+## Development
+
+```bash
+ruff check . && ruff format --check .
+pytest --cov=homelab_ops_mcp --cov-report=term-missing
+pip-audit --strict .
+```
+
+CI (`.github/workflows/ci.yml`) runs these across Python 3.11–3.13.
 
 ## Wiring into a Claude config (streamable HTTP)
 
