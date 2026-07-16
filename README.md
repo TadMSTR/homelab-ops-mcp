@@ -23,25 +23,53 @@ Streamable-HTTP on `http://0.0.0.0:<port>/mcp` (default port 8282).
 
 For LibreChat agents running in Docker, the host is reachable at `http://host.docker.internal:8282/mcp`. Note: `host.docker.internal` bypasses LibreChat's SSRF guard (which blocks private IP ranges) — use this hostname rather than `127.0.0.1`.
 
-## Prerequisites
+## Installation
 
 ```bash
-pip3 install fastmcp psutil
+pip install .           # or: pip install -e .   for development
 ```
+
+This installs the `homelab_ops_mcp` package and a `homelab-ops-mcp` console script.
 
 ## Running
 
 ```bash
-python3 server.py                        # default host 0.0.0.0, port 8282
-python3 server.py --port 9090            # custom port
-python3 server.py --host 127.0.0.1       # local-only (more restrictive)
+homelab-ops-mcp                          # default host 0.0.0.0, port 8282
+homelab-ops-mcp --port 9090              # custom port
+homelab-ops-mcp --host 127.0.0.1         # local-only (more restrictive)
 ```
+
+A backward-compatible `python server.py --host … --port …` shim is retained for
+existing deployments (it just calls the package entry point after an editable install).
 
 With PM2:
 ```bash
-pm2 start server.py --name homelab-ops-mcp --interpreter python3 -- --port 8282
+pm2 start homelab-ops-mcp --name homelab-ops-mcp -- --port 8282
 pm2 save
 ```
+
+### Logging
+
+Structured JSON logs go to stderr by default. Tune via environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `LOG_FILE` | _(unset)_ | Append logs to this path instead of stderr |
+
+Command text and file contents are logged at `DEBUG` only; `INFO` records carry
+non-sensitive metadata (paths, cwd, exit codes).
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+ruff check . && ruff format --check .
+pytest --cov=homelab_ops_mcp --cov-report=term-missing
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and [ARCHITECTURE.md](ARCHITECTURE.md)
+for the layout. CI runs the same checks across Python 3.11–3.13.
 
 ## MCP Client Configuration
 
