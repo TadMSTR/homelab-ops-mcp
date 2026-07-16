@@ -9,6 +9,7 @@ and list_processes. All server logic lives here; see ARCHITECTURE.md for the lay
 import contextlib
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import psutil
@@ -45,6 +46,29 @@ _PM2_IPC_ENV_VARS = (
 def _clean_env() -> dict:
     """Return a copy of the current environment with PM2 IPC vars stripped."""
     return {k: v for k, v in os.environ.items() if k not in _PM2_IPC_ENV_VARS}
+
+
+def _atomic_write(path: Path, content: str) -> int:
+    """Write ``content`` to ``path`` atomically and return the byte count.
+
+    Writes to a temp file in the same directory (so ``os.replace`` stays on one
+    filesystem), then renames over the target — a crash mid-write leaves either
+    the old file or the new one, never a truncated mix. The mode of an existing
+    target is preserved; new files keep the secure 0600 mode from ``mkstemp``.
+    """
+    data = content.encode()
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return len(data)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +187,7 @@ def write_file(
         p = Path(path)
         if create_dirs:
             p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        written = len(content.encode())
+        written = _atomic_write(p, content)
         log.info("write_file.done", path=path, bytes_written=written)
         return {"path": path, "bytes_written": written}
     except PermissionError:
@@ -209,7 +232,7 @@ def edit_file(
             }
 
         updated = original.replace(old_str, new_str, 1)
-        p.write_text(updated)
+        _atomic_write(p, updated)
         log.info("edit_file.done", path=path, matches_replaced=1)
         return {"path": path, "status": "ok", "matches_replaced": 1}
     except PermissionError:
@@ -325,7 +348,15 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="homelab-ops MCP server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    # Default to loopback: this server offers unauthenticated arbitrary shell exec
+    # and filesystem access, so network isolation is the only control. Pass
+    # --host 0.0.0.0 explicitly to expose it (e.g. for container reachability via
+    # host.docker.internal). See SECURITY.md / audit homelab-ops-mcp-v02 (MEDIUM).
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host (default: 127.0.0.1; pass 0.0.0.0 to expose to containers)",
+    )
     parser.add_argument("--port", type=int, default=8282, help="Bind port (default: 8282)")
     parser.add_argument("--path", default="/mcp", help="HTTP path (default: /mcp)")
     args = parser.parse_args()

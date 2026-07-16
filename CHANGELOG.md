@@ -26,6 +26,20 @@ same six tools, same streamable-http transport, same wire contract.
   install (`pip install -e .`).
 - Expanded `.gitignore` to the standard set.
 
+### Security
+
+Remediates the `homelab-ops-mcp-v02` audit (1 Medium, 2 Low; no blockers):
+
+- **[Medium]** `--host` now defaults to `127.0.0.1` instead of `0.0.0.0`. This server
+  offers unauthenticated shell execution and filesystem access, so loopback is the safe
+  default; pass `--host 0.0.0.0` explicitly to expose it (e.g. container reachability).
+  The PM2 deploy already passed `127.0.0.1` explicitly, so there is no deploy-behavior change.
+- **[Low]** `write_file` and `edit_file` now write atomically (temp file + `os.replace`),
+  so a crash mid-write can no longer leave a truncated file. Existing file modes are preserved;
+  newly created files keep a private `0600` mode.
+- **[Low]** Removed a stray pre-fix core dump from the working tree and documented
+  `ulimit -c 0` guidance for the deploy.
+
 ### Deploy note
 
 - Deploying this version requires `pip install -e .` in the server's venv (installs the

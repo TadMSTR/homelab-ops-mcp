@@ -34,13 +34,14 @@ def test_read_file_generic_error(monkeypatch, sample_file):
 
 # --- write_file --------------------------------------------------------------
 def test_write_file_permission_denied(monkeypatch, tmp_path):
-    monkeypatch.setattr(server.Path, "write_text", _raise(PermissionError()))
+    # write_file now writes atomically via tempfile.mkstemp; fail there.
+    monkeypatch.setattr(server.tempfile, "mkstemp", _raise(PermissionError()))
     r = write_file(str(tmp_path / "x.txt"), "data")
     assert "permission denied" in r["error"].lower()
 
 
 def test_write_file_generic_error(monkeypatch, tmp_path):
-    monkeypatch.setattr(server.Path, "write_text", _raise(ValueError("nope")))
+    monkeypatch.setattr(server.tempfile, "mkstemp", _raise(ValueError("nope")))
     r = write_file(str(tmp_path / "x.txt"), "data")
     assert r["error"] == "nope"
 

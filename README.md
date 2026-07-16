@@ -19,9 +19,16 @@ This server provides **unrestricted shell access** to the host machine. Any MCP 
 
 ## Transport
 
-Streamable-HTTP on `http://0.0.0.0:<port>/mcp` (default port 8282).
+Streamable-HTTP on `http://<host>:<port>/mcp` (default `127.0.0.1:8282`).
 
-For LibreChat agents running in Docker, the host is reachable at `http://host.docker.internal:8282/mcp`. Note: `host.docker.internal` bypasses LibreChat's SSRF guard (which blocks private IP ranges) — use this hostname rather than `127.0.0.1`.
+The bind host defaults to `127.0.0.1` (loopback only). Because this server offers
+**unauthenticated** shell execution and filesystem access, network isolation is the only
+control — keep it loopback-bound unless you have a specific reason to expose it.
+
+To reach it from a **LibreChat container** via `host.docker.internal`, start it with
+`--host 0.0.0.0` explicitly (loopback isn't reachable from another container's network
+namespace). Only do this on a trusted, isolated network. Note: `host.docker.internal`
+bypasses LibreChat's SSRF guard (which blocks private IP ranges).
 
 ## Installation
 
@@ -34,9 +41,9 @@ This installs the `homelab_ops_mcp` package and a `homelab-ops-mcp` console scri
 ## Running
 
 ```bash
-homelab-ops-mcp                          # default host 0.0.0.0, port 8282
+homelab-ops-mcp                          # default host 127.0.0.1 (loopback), port 8282
 homelab-ops-mcp --port 9090              # custom port
-homelab-ops-mcp --host 127.0.0.1         # local-only (more restrictive)
+homelab-ops-mcp --host 0.0.0.0           # expose to containers/LAN (unauthenticated — use with care)
 ```
 
 A backward-compatible `python server.py --host … --port …` shim is retained for
