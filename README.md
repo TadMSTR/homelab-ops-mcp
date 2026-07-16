@@ -25,10 +25,11 @@ The bind host defaults to `127.0.0.1` (loopback only). Because this server offer
 **unauthenticated** shell execution and filesystem access, network isolation is the only
 control — keep it loopback-bound unless you have a specific reason to expose it.
 
-To reach it from a **LibreChat container** via `host.docker.internal`, start it with
-`--host 0.0.0.0` explicitly (loopback isn't reachable from another container's network
-namespace). Only do this on a trusted, isolated network. Note: `host.docker.internal`
-bypasses LibreChat's SSRF guard (which blocks private IP ranges).
+If an MCP client runs in its own container or network namespace and must reach the server
+across it, bind `--host 0.0.0.0` explicitly — loopback isn't reachable from another
+namespace. Do this only on a trusted, isolated network, and be aware that a container
+reaching the host via `host.docker.internal` bypasses any SSRF guard that blocks private
+IP ranges.
 
 ## Installation
 
@@ -86,8 +87,12 @@ for the layout. CI runs the same checks across Python 3.11–3.13.
 mcpServers:
   homelab-ops:
     type: streamable-http
-    url: http://host.docker.internal:8282/mcp
+    url: http://127.0.0.1:8282/mcp
 ```
+
+If LibreChat runs in a container (so the server is on a different host/namespace), use
+`http://host.docker.internal:8282/mcp` and start the server with `--host 0.0.0.0` — see the
+Transport section for the security caveats.
 
 ### Claude Code (`.claude/claude_desktop_config.json` or MCP settings)
 
