@@ -21,6 +21,26 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
+# Environment sanitisation
+# ---------------------------------------------------------------------------
+# PM2 sets these variables in the process environment for its own IPC channel.
+# If they leak into spawned children, any Node.js child (node, pnpm, tsc, or any
+# node CLI) inherits a stray file descriptor and SIGABRTs during process
+# teardown — 100% reproducible via run_command, 0% via a direct shell. Strip
+# them before exec so shelled-out commands run in a clean environment. (HLOPS-1)
+_PM2_IPC_ENV_VARS = (
+    "NODE_CHANNEL_FD",
+    "NODE_CHANNEL_SERIALIZATION_MODE",
+    "NODE_UNIQUE_ID",
+)
+
+
+def _clean_env() -> dict:
+    """Return a copy of the current environment with PM2 IPC vars stripped."""
+    return {k: v for k, v in os.environ.items() if k not in _PM2_IPC_ENV_VARS}
+
+
+# ---------------------------------------------------------------------------
 # run_command
 # ---------------------------------------------------------------------------
 @mcp.tool
@@ -44,6 +64,7 @@ def run_command(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_clean_env(),
         )
         return {
             "stdout": result.stdout,
