@@ -2,8 +2,10 @@ module.exports = {
   apps: [
     {
       name: "system-ops",
-      script: "/home/ted/repos/personal/homelab-ops-mcp/.venv/bin/python3",
-      args: ["server.py", "--host", "127.0.0.1", "--port", "8282"],
+      // run-hardened.sh sets `ulimit -c 0` before exec'ing the venv python3 server —
+      // PM2 fork_mode has no native ulimit option (HLOPS-1 audit LOW: no core dumps on crash).
+      script: "/home/ted/repos/personal/homelab-ops-mcp/run-hardened.sh",
+      args: ["--host", "127.0.0.1", "--port", "8282"],
       cwd: "/home/ted/repos/personal/homelab-ops-mcp",
       interpreter: "none",
 
