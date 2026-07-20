@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1] — 2026-07-20
+
+### Security
+
+- **[Low]** `ecosystem.config.js` now runs the server through `run-hardened.sh`, a
+  wrapper that sets `ulimit -c 0` before exec'ing the venv python3 process. PM2
+  fork_mode has no native ulimit option, so a crash could previously leave a core
+  dump on disk (a stray 37MB dump was found and removed during HLOPS-1 remediation).
+  Remainder of the `homelab-ops-mcp-v02` audit LOW deferred from the v0.2.0 deploy.
+
 ## [0.2.0] — 2026-07-16
 
 Repo brought up to the current forge MCP repo standard. No tool behavior changes —
