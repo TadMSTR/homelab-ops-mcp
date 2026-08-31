@@ -4,12 +4,13 @@ MCP server that gives AI agents shell access, file read/write, and process inspe
 
 ## What it does
 
-Exposes six tools:
+Exposes seven tools:
 
-- **`run_command`** — executes arbitrary shell commands via `bash -c`, returns stdout/stderr/exit code
+- **`run_command`** — executes arbitrary shell commands via `bash -c`, returns stdout/stderr/exit code, `execution_time`, and a `truncated` flag
 - **`read_file`** — reads a file with optional line range
+- **`read_multiple_files`** — reads several files in one call; a failing path does not fail the rest
 - **`write_file`** — overwrites a file (creates parent dirs by default)
-- **`edit_file`** — find-and-replace edit; `old_str` must match exactly once
+- **`edit_file`** — find-and-replace edit; `old_str` must match exactly once. Supports `dry_run`, and reports the closest passage with a diff when nothing matches
 - **`read_directory`** — lists directory contents, optionally recursive
 - **`list_processes`** — lists running processes sorted by CPU, memory, or PID
 

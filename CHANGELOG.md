@@ -50,6 +50,26 @@
   sharing it. The PM2 IPC variables stay excluded in both modes and cannot be re-added
   through the allowlist.
 
+- **`read_multiple_files(paths)`** — read several files in one call. Each path gets its own
+  result, so one bad path does not fail the rest, and the response carries `ok`/`failed`
+  counts. `read_file` was the second most-called tool here and agents were paying a round
+  trip per file.
+
+- **`dry_run` on `edit_file`** — reports what the edit would do, including the size change,
+  and writes nothing. `dry_run` is on every `edit_file` response so its absence and its
+  falsity are not the same thing.
+
+- **Closest-match feedback on a failed `edit_file`.** A failed match returned only a count,
+  which says something is wrong but not what — and an agent faced with that tends to
+  abandon the edit and rewrite the whole file, a far larger and riskier write than the one
+  it was attempting. The response now carries the most similar passage in the file, its line
+  number, a similarity score, and an `ndiff` whose `?` lines mark the differing *characters*.
+  Nothing is reported when the file is over 2 MiB or when nothing resembles the request
+  closely enough to be worth quoting — a confident wrong guess is worse than none.
+
+- **`execution_time`** on every `run_command` response — wall-clock seconds, on the success,
+  timeout and error paths alike.
+
 - **Optional telemetry** (`telemetry.py`, `[telemetry]` extra). OTLP traces and metrics,
   plus InfluxDB 3 and NATS sinks, each gated on its own environment variable and all off by
   default. No telemetry library is in the base dependencies and every backend import is

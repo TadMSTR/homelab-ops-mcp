@@ -2,11 +2,13 @@
 
 Transport: streamable-http on 0.0.0.0:<port>/mcp
 
-Exposes six tools: run_command, read_file, write_file, edit_file, read_directory,
-and list_processes. All server logic lives here; see ARCHITECTURE.md for the layout.
+Exposes seven tools: run_command, read_file, read_multiple_files, write_file,
+edit_file, read_directory, and list_processes. All server logic lives here; see
+ARCHITECTURE.md for the layout.
 """
 
 import contextlib
+import difflib
 import functools
 import os
 import re
@@ -378,6 +380,9 @@ def run_command(
     Each stream is captured up to SYSTEM_OPS_OUTPUT_LIMIT_BYTES (default 1 MiB).
     If either reaches the cap the process is killed and ``truncated`` is true,
     so a capped result is distinguishable from a genuinely short one.
+
+    Every response carries ``execution_time``, the wall-clock seconds the
+    command took.
     """
     working_dir = cwd or str(Path.home())
     # Only the working directory is validated. Tilde paths *inside* ``command``
@@ -403,10 +408,12 @@ def run_command(
     # Command text is sensitive; log it at DEBUG only.
     log.debug("run_command.start", cwd=working_dir, timeout=timeout, command=command)
     limit = _output_limit()
+    started = time.perf_counter()
     try:
         stdout, stderr, exit_code, truncated, timed_out = _run_capped(
             command, working_dir, child_env, timeout, limit
         )
+        elapsed = round(time.perf_counter() - started, 4)
         if timed_out:
             log.warning(
                 "run_command.timeout",
@@ -420,6 +427,7 @@ def run_command(
                 "stderr": f"Command timed out after {timeout} seconds.",
                 "exit_code": -1,
                 "truncated": truncated,
+                "execution_time": elapsed,
             }
         if truncated:
             if len(stdout.encode(errors="replace")) >= limit:
@@ -445,6 +453,7 @@ def run_command(
             "stderr": stderr,
             "exit_code": exit_code,
             "truncated": truncated,
+            "execution_time": elapsed,
         }
     except Exception as e:
         log.error(
@@ -454,7 +463,13 @@ def run_command(
             env_withheld_count=withheld,
             env_enforced=enforced,
         )
-        return {"stdout": "", "stderr": str(e), "exit_code": -1, "truncated": False}
+        return {
+            "stdout": "",
+            "stderr": str(e),
+            "exit_code": -1,
+            "truncated": False,
+            "execution_time": round(time.perf_counter() - started, 4),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +527,28 @@ def read_file(
 
 
 # ---------------------------------------------------------------------------
+# read_multiple_files
+# ---------------------------------------------------------------------------
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@_instrumented
+def read_multiple_files(paths: list[str]) -> dict:
+    """Read several files in one call. Returns a result per path.
+
+    One failing path does not fail the others — each entry is either a file
+    result or an ``error``, so a partial read is still useful.
+
+    Args:
+        paths: Absolute paths to read.
+    """
+    results = {}
+    for path in paths:
+        results[path] = read_file(path)
+    ok = sum(1 for r in results.values() if "error" not in r)
+    log.info("read_multiple_files.done", count=len(paths), ok=ok)
+    return {"count": len(paths), "ok": ok, "failed": len(paths) - ok, "files": results}
+
+
+# ---------------------------------------------------------------------------
 # write_file
 # ---------------------------------------------------------------------------
 @mcp.tool(
@@ -555,6 +592,69 @@ def write_file(
 
 
 # ---------------------------------------------------------------------------
+# edit_file support
+# ---------------------------------------------------------------------------
+# Searching every window of a very large file is not worth the wall time, and
+# the caller is better served by a fast "not found" than a slow near-miss.
+_CLOSEST_MATCH_MAX_BYTES = 2 * 1024 * 1024
+# Below this similarity the "closest" window is noise and quoting it misleads.
+_CLOSEST_MATCH_MIN_RATIO = 0.5
+_DIFF_MAX_LINES = 40
+
+
+def _closest_match(content: str, old_str: str) -> dict | None:
+    """Find the passage most like ``old_str`` and diff it against the request.
+
+    A failed edit previously returned only a match count, which tells the caller
+    that something is wrong but not what. Faced with that, an agent tends to
+    give up on editing and rewrite the whole file — which is a much larger and
+    riskier write than the edit it was trying to make.
+
+    Returns None when the file is too large to scan or nothing resembles
+    ``old_str`` closely enough to be worth quoting.
+    """
+    if len(content) > _CLOSEST_MATCH_MAX_BYTES:
+        return None
+
+    lines = content.splitlines(keepends=True)
+    old_lines = old_str.splitlines(keepends=True) or [""]
+    span = len(old_lines)
+    if not lines:
+        return None
+
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq1(old_str)
+    best_ratio, best_index, best_text = 0.0, 0, ""
+    for i in range(max(1, len(lines) - span + 1)):
+        window = "".join(lines[i : i + span])
+        matcher.set_seq2(window)
+        # quick_ratio is an upper bound, so a window that cannot beat the
+        # current best is skipped without the quadratic comparison.
+        if matcher.quick_ratio() <= best_ratio:
+            continue
+        ratio = matcher.ratio()
+        if ratio > best_ratio:
+            best_ratio, best_index, best_text = ratio, i, window
+
+    if best_ratio < _CLOSEST_MATCH_MIN_RATIO:
+        return None
+
+    diff = list(difflib.ndiff(old_lines, best_text.splitlines(keepends=True)))
+    truncated = len(diff) > _DIFF_MAX_LINES
+    if truncated:
+        diff = [*diff[:_DIFF_MAX_LINES], f"... {len(diff) - _DIFF_MAX_LINES} more diff lines"]
+
+    return {
+        "closest_match": best_text,
+        "closest_match_line": best_index + 1,
+        "similarity": round(best_ratio, 3),
+        # ndiff marks changed characters on its "?" lines, so this shows which
+        # characters differ, not merely which lines.
+        "diff": "".join(line if line.endswith("\n") else line + "\n" for line in diff),
+    }
+
+
+# ---------------------------------------------------------------------------
 # edit_file
 # ---------------------------------------------------------------------------
 @mcp.tool(
@@ -571,15 +671,19 @@ def edit_file(
     path: str,
     old_str: str,
     new_str: str,
+    dry_run: bool = False,
 ) -> dict:
     """Find-and-replace edit: replace old_str with new_str in a file.
 
     old_str must match exactly once. Fails if zero or multiple matches found.
+    When no match is found, the result carries the closest passage in the file,
+    its line number, and a diff against what was asked for.
 
     Args:
         path: Absolute path to the file.
         old_str: Exact string to find (must match exactly once).
         new_str: Replacement string.
+        dry_run: If True, report what the edit would do and write nothing.
     """
     try:
         p = _resolve_path(path)
@@ -590,16 +694,31 @@ def edit_file(
         count = original.count(old_str)
 
         if count == 0:
-            return {"error": "old_str not found in file. No changes made."}
+            result = {"error": "old_str not found in file. No changes made."}
+            hint = _closest_match(original, old_str)
+            if hint:
+                result.update(hint)
+            log.info("edit_file.no_match", path=path, had_hint=bool(hint))
+            return result
         if count > 1:
             return {
                 "error": f"old_str matched {count} times. Must match exactly once. No changes made."
             }
 
         updated = original.replace(old_str, new_str, 1)
+        if dry_run:
+            log.info("edit_file.dry_run", path=path, matches_replaced=1)
+            return {
+                "path": path,
+                "status": "ok",
+                "matches_replaced": 1,
+                "dry_run": True,
+                "bytes_before": len(original.encode()),
+                "bytes_after": len(updated.encode()),
+            }
         _atomic_write(p, updated)
         log.info("edit_file.done", path=path, matches_replaced=1)
-        return {"path": path, "status": "ok", "matches_replaced": 1}
+        return {"path": path, "status": "ok", "matches_replaced": 1, "dry_run": False}
     except PathValidationError as e:
         log.warning("edit_file.invalid_path", path=path)
         return {"error": str(e)}

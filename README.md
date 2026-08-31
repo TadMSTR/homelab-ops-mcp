@@ -12,8 +12,9 @@ This server provides **unrestricted shell access** to the host machine. Any MCP 
 |------|-------------|
 | `run_command` | Execute a shell command (`bash -c`), returns stdout/stderr/exit_code |
 | `read_file` | Read a file by absolute path, optional `start_line`/`end_line` |
+| `read_multiple_files` | Read several files in one call; one failure does not fail the rest |
 | `write_file` | Write/overwrite a file, creates parent dirs by default |
-| `edit_file` | Find-and-replace edit — `old_str` must match exactly once |
+| `edit_file` | Find-and-replace edit — `old_str` must match exactly once; `dry_run` supported |
 | `read_directory` | List directory contents, optional recursive with `max_depth` |
 | `list_processes` | List running processes sorted by cpu/mem/pid, optional name filter |
 
@@ -25,6 +26,7 @@ maintaining a list of tool names:
 | Tool | readOnlyHint | idempotentHint | destructiveHint | openWorldHint |
 |---|---|---|---|---|
 | `read_file` | true | – | – | false |
+| `read_multiple_files` | true | – | – | false |
 | `read_directory` | true | – | – | false |
 | `list_processes` | true | – | – | false |
 | `write_file` | false | true | true | false |

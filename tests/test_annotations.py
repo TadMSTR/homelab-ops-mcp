@@ -18,6 +18,7 @@ from homelab_ops_mcp.server import mcp
 EXPECTED = {
     "read_file": {"readOnlyHint": True, "openWorldHint": False},
     "read_directory": {"readOnlyHint": True, "openWorldHint": False},
+    "read_multiple_files": {"readOnlyHint": True, "openWorldHint": False},
     "list_processes": {"readOnlyHint": True, "openWorldHint": False},
     "write_file": {
         "readOnlyHint": False,
@@ -87,7 +88,12 @@ def test_read_only_tools_are_exactly_the_non_mutating_ones(tools):
         for name, t in tools.items()
         if t.annotations.model_dump(by_alias=True).get("readOnlyHint")
     }
-    assert read_only == {"read_file", "read_directory", "list_processes"}
+    assert read_only == {
+        "read_file",
+        "read_multiple_files",
+        "read_directory",
+        "list_processes",
+    }
 
 
 def test_every_writing_tool_is_marked_destructive(tools):
@@ -99,7 +105,7 @@ def test_every_writing_tool_is_marked_destructive(tools):
 
 def test_read_only_tools_omit_the_write_hints(tools):
     """Per the spec those two hints have no meaning when readOnlyHint is true."""
-    for name in ("read_file", "read_directory", "list_processes"):
+    for name in ("read_file", "read_multiple_files", "read_directory", "list_processes"):
         dumped = tools[name].annotations.model_dump(by_alias=True, exclude_none=True)
         assert "destructiveHint" not in dumped
         assert "idempotentHint" not in dumped
