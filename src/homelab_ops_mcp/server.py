@@ -21,7 +21,6 @@ from pathlib import Path
 
 import psutil
 from fastmcp import FastMCP
-from mcp.types import ToolAnnotations
 
 from . import telemetry
 from .logging import configure_logging, tame_library_logging
@@ -351,18 +350,35 @@ def _mark_truncated(text: str, limit: int) -> str:
     return f"{text}\n[truncated: output reached the {limit}-byte per-stream cap]"
 
 
+# Tool annotations below are declared as plain dicts using the MCP spec's own
+# camelCase key names, rather than by constructing an mcp.types.ToolAnnotations
+# with snake_case keyword arguments.
+#
+# The two are not interchangeable across versions. In mcp 1.27.1 — the version
+# deployed here — that model's fields are literally named `readOnlyHint`, there
+# are no aliases, and it is configured `extra="allow"`. A snake_case keyword
+# does not raise there: it is silently kept as an unrelated extra attribute
+# while the real `readOnlyHint` stays None, so the tool ships with no usable
+# annotation at all and the wire response carries a junk key instead. Newer mcp
+# renames the fields to snake_case with camelCase aliases, where the keyword
+# form works and this dict still validates by alias.
+#
+# The dict is correct on both: it matches the field name on the old version and
+# the alias on the new one. Verified against both.
+
+
 # ---------------------------------------------------------------------------
 # run_command
 # ---------------------------------------------------------------------------
 @mcp.tool(
-    annotations=ToolAnnotations(
-        read_only_hint=False,
-        idempotent_hint=False,
-        destructive_hint=True,
+    annotations={
+        "readOnlyHint": False,
+        "idempotentHint": False,
+        "destructiveHint": True,
         # The only tool here that can reach the network: it runs arbitrary
         # shell, so curl, git push and apt are all inside its envelope.
-        open_world_hint=True,
-    )
+        "openWorldHint": True,
+    }
 )
 @_instrumented
 def run_command(
@@ -475,7 +491,7 @@ def run_command(
 # ---------------------------------------------------------------------------
 # read_file
 # ---------------------------------------------------------------------------
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def read_file(
     path: str,
@@ -529,7 +545,7 @@ def read_file(
 # ---------------------------------------------------------------------------
 # read_multiple_files
 # ---------------------------------------------------------------------------
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def read_multiple_files(paths: list[str]) -> dict:
     """Read several files in one call. Returns a result per path.
@@ -552,13 +568,13 @@ def read_multiple_files(paths: list[str]) -> dict:
 # write_file
 # ---------------------------------------------------------------------------
 @mcp.tool(
-    annotations=ToolAnnotations(
-        read_only_hint=False,
+    annotations={
+        "readOnlyHint": False,
         # Writing the same content twice leaves the same file.
-        idempotent_hint=True,
-        destructive_hint=True,
-        open_world_hint=False,
-    )
+        "idempotentHint": True,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    }
 )
 @_instrumented
 def write_file(
@@ -658,13 +674,13 @@ def _closest_match(content: str, old_str: str) -> dict | None:
 # edit_file
 # ---------------------------------------------------------------------------
 @mcp.tool(
-    annotations=ToolAnnotations(
-        read_only_hint=False,
+    annotations={
+        "readOnlyHint": False,
         # Not idempotent: the second call finds no match and fails.
-        idempotent_hint=False,
-        destructive_hint=True,
-        open_world_hint=False,
-    )
+        "idempotentHint": False,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    }
 )
 @_instrumented
 def edit_file(
@@ -733,7 +749,7 @@ def edit_file(
 # ---------------------------------------------------------------------------
 # read_directory
 # ---------------------------------------------------------------------------
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def read_directory(
     path: str,
@@ -787,7 +803,7 @@ def read_directory(
 # ---------------------------------------------------------------------------
 # list_processes
 # ---------------------------------------------------------------------------
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def list_processes(
     sort_by: str = "cpu",

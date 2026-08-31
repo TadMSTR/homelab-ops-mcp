@@ -117,3 +117,41 @@ def test_write_file_is_idempotent_and_edit_file_is_not(tools):
     e = tools["edit_file"].annotations.model_dump(by_alias=True)
     assert w["idempotentHint"] is True
     assert e["idempotentHint"] is False
+
+
+SNAKE_KEYS = {
+    "read_only_hint",
+    "destructive_hint",
+    "idempotent_hint",
+    "open_world_hint",
+}
+
+
+def test_no_snake_case_keys_reach_the_wire(tools):
+    """The spec's field names are camelCase, and a snake_case key is not a rename.
+
+    In mcp 1.27.1 the model's fields are literally named ``readOnlyHint`` with no
+    aliases and ``extra="allow"``, so a snake_case keyword argument is accepted
+    silently as an unrelated extra: the real hint stays None and the response
+    carries a junk key no client reads. Newer mcp renames the fields and adds
+    aliases, so the same code is correct there — which is exactly what makes
+    this worth pinning, since the two versions disagree without erroring and CI
+    does not necessarily install what production runs.
+    """
+    for name, tool in tools.items():
+        dumped = tool.annotations.model_dump(by_alias=True, exclude_none=True)
+        leaked = SNAKE_KEYS & set(dumped)
+        assert leaked == set(), f"{name} emitted snake_case annotation keys: {leaked}"
+
+
+def test_hint_values_are_actually_set_not_just_present(tools):
+    """Guards the same failure from the other side.
+
+    An annotation object can exist and dump to something while every hint the
+    code set is None — that is precisely how the mcp 1.27.1 mismatch presents.
+    """
+    for name, expected in EXPECTED.items():
+        dumped = tools[name].annotations.model_dump(by_alias=True, exclude_none=True)
+        for key, value in expected.items():
+            assert key in dumped, f"{name} is missing {key}"
+            assert dumped[key] is value, f"{name}.{key} is {dumped[key]!r}, expected {value!r}"
