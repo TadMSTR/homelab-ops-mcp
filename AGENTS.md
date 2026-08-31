@@ -24,8 +24,15 @@ server.py         # Root shim → homelab_ops_mcp.server:main (backward-compat)
 tests/            # pytest suite (~96% coverage)
 ```
 
-All settings come from CLI args (`--host`, `--port`, `--path`) or the logging env
-vars — no config file. See `ARCHITECTURE.md` for detail.
+All settings come from CLI args (`--host`, `--port`, `--path`) or environment
+variables — no config file. The env vars are `LOG_LEVEL` and `LOG_FILE` for logging,
+and `SYSTEM_OPS_CHILD_ENV_ENFORCE` / `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` for the
+environment handed to `run_command`'s children (see README). Every one has a safe
+in-code default. See `ARCHITECTURE.md` for detail.
+
+Paths passed to the file tools and to `run_command`'s `cwd` must be absolute. They are
+rejected otherwise — `Path()` does no tilde expansion, so a `~/...` path would resolve
+against the process working directory instead.
 
 ## Running locally
 

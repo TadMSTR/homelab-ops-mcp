@@ -8,6 +8,7 @@ and list_processes. All server logic lives here; see ARCHITECTURE.md for the lay
 
 import contextlib
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -46,6 +47,118 @@ _PM2_IPC_ENV_VARS = (
 def _clean_env() -> dict:
     """Return a copy of the current environment with PM2 IPC vars stripped."""
     return {k: v for k, v in os.environ.items() if k not in _PM2_IPC_ENV_VARS}
+
+
+# The variables a shelled-out child receives by default. This is an allowlist
+# rather than a denylist deliberately: a denylist forwards everything nobody
+# thought to name, so every key later added to the parent's environment reaches
+# every child automatically and silently.
+#
+# The LC_* locale variables are enumerated rather than prefix-matched. They are
+# a closed POSIX set, so enumerating costs nothing and means a future variable
+# that merely starts with "LC_" cannot ride in on a pattern.
+_BASE_CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "TZ",
+        "LC_ALL",
+        "LC_ADDRESS",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_IDENTIFICATION",
+        "LC_MEASUREMENT",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NAME",
+        "LC_NUMERIC",
+        "LC_PAPER",
+        "LC_TELEPHONE",
+        "LC_TIME",
+    }
+)
+
+_ENFORCE_ENV_VAR = "SYSTEM_OPS_CHILD_ENV_ENFORCE"
+_ALLOWLIST_ENV_VAR = "SYSTEM_OPS_CHILD_ENV_ALLOWLIST"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_GLOB_CHARS = "*?["
+
+
+def _child_env_enforced() -> bool:
+    """Whether the allowlist is enforced, or merely measured (the default)."""
+    return os.environ.get(_ENFORCE_ENV_VAR, "").strip().lower() in _TRUTHY
+
+
+def _child_env_allowlist() -> frozenset:
+    """The base allowlist plus any exact names from ``SYSTEM_OPS_CHILD_ENV_ALLOWLIST``.
+
+    Entries are exact variable names, comma-separated. Glob patterns are
+    refused rather than matched, because a prefix would auto-promote every
+    future key sharing it — which is precisely what the allowlist exists to
+    prevent. A refused entry is logged by name (a name from local config, not a
+    value) so a mistyped pattern surfaces instead of silently doing nothing.
+    """
+    extra = set()
+    for entry in os.environ.get(_ALLOWLIST_ENV_VAR, "").split(","):
+        name = entry.strip()
+        if not name:
+            continue
+        if any(c in name for c in _GLOB_CHARS):
+            log.warning("child_env.glob_rejected", entry=name)
+            continue
+        extra.add(name)
+    return _BASE_CHILD_ENV_ALLOWLIST | frozenset(extra)
+
+
+# ``$VAR`` and ``${VAR}``. The leading character class excludes ``$1``, ``$@``
+# and friends, which are shell positionals rather than environment lookups.
+_ENV_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+
+def _referenced_withheld(command: str, allowed: frozenset) -> list:
+    """Variable names the command reads that enforcement would take away.
+
+    The withheld *count* is the same on every call — it describes the parent
+    environment, not the command — so on its own it cannot say which callers
+    enforcement would break. This can: it intersects what the command text
+    actually references with what the allowlist would remove, which is the list
+    an operator needs to build ``SYSTEM_OPS_CHILD_ENV_ALLOWLIST``.
+
+    Names only. The values are never read, and a name that is not set in the
+    parent environment is not reported, since withholding it changes nothing.
+
+    Deliberately approximate: a ``$VAR`` inside single quotes is counted even
+    though the shell would not expand it, and an indirect read such as
+    ``env | grep FOO`` is missed entirely. It over-reports rather than
+    under-reports, which is the right way round for a signal used to decide
+    whether it is safe to enforce.
+    """
+    refs = {m.group(1) for m in _ENV_REF_RE.finditer(command)}
+    return sorted(r for r in refs if r in os.environ and r not in allowed)
+
+
+def _child_env() -> tuple[dict, int]:
+    """Return the child's environment, and how many variables were withheld.
+
+    In shadow mode — the default — the full parent environment is returned but
+    the withheld count is still computed, so the blast radius of enforcement can
+    be measured before enforcement is switched on. The count means the same
+    thing in both modes: how many variables the allowlist excludes.
+
+    The PM2 IPC variables are dropped before the allowlist is applied, so they
+    stay out in both modes and cannot be re-added via
+    ``SYSTEM_OPS_CHILD_ENV_ALLOWLIST`` (HLOPS-1).
+    """
+    parent = _clean_env()
+    allowed = _child_env_allowlist()
+    kept = {k: v for k, v in parent.items() if k in allowed}
+    withheld = len(parent) - len(kept)
+    return (kept if _child_env_enforced() else parent), withheld
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +236,19 @@ def run_command(
     except PathValidationError as e:
         log.warning("run_command.invalid_cwd", cwd=working_dir)
         return {"stdout": "", "stderr": f"cwd: {e}", "exit_code": -1}
+    # Of the environment itself only the count is logged — never a name, never
+    # a value. The separate `at_risk` list holds names the *caller* wrote into
+    # the command text, which is caller-authored config rather than a secret.
+    child_env, withheld = _child_env()
+    enforced = _child_env_enforced()
+    at_risk = _referenced_withheld(command, _child_env_allowlist())
+    if at_risk:
+        log.info(
+            "run_command.env_referenced_withheld",
+            cwd=working_dir,
+            names=at_risk,
+            enforced=enforced,
+        )
     # Command text is sensitive; log it at DEBUG only.
     log.debug("run_command.start", cwd=working_dir, timeout=timeout, command=command)
     try:
@@ -132,23 +258,41 @@ def run_command(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=_clean_env(),
+            env=child_env,
         )
-        log.info("run_command.done", cwd=working_dir, exit_code=result.returncode)
+        log.info(
+            "run_command.done",
+            cwd=working_dir,
+            exit_code=result.returncode,
+            env_withheld_count=withheld,
+            env_enforced=enforced,
+        )
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "exit_code": result.returncode,
         }
     except subprocess.TimeoutExpired:
-        log.warning("run_command.timeout", cwd=working_dir, timeout=timeout)
+        log.warning(
+            "run_command.timeout",
+            cwd=working_dir,
+            timeout=timeout,
+            env_withheld_count=withheld,
+            env_enforced=enforced,
+        )
         return {
             "stdout": "",
             "stderr": f"Command timed out after {timeout} seconds.",
             "exit_code": -1,
         }
     except Exception as e:
-        log.error("run_command.error", cwd=working_dir, error=str(e))
+        log.error(
+            "run_command.error",
+            cwd=working_dir,
+            error=str(e),
+            env_withheld_count=withheld,
+            env_enforced=enforced,
+        )
         return {"stdout": "", "stderr": str(e), "exit_code": -1}
 
 

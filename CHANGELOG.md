@@ -23,6 +23,33 @@
 
 ### Added
 
+- **Child process environment allowlist for `run_command`.** The environment handed to
+  a shelled-out child can now be restricted to an explicit allowlist —
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TZ` and the POSIX `LC_*`
+  variables — extended with exact names via `SYSTEM_OPS_CHILD_ENV_ALLOWLIST`. Previously
+  the child inherited the server's whole environment apart from three PM2 IPC variables,
+  which meant anything the server was started with reached every command it ran, whether
+  or not that command had any use for it.
+
+  It ships **off by default**, in shadow mode: behaviour is unchanged, but
+  `run_command`'s `.done`, `.timeout` and `.error` log records now carry
+  `env_withheld_count` (how many variables enforcement would remove) and `env_enforced`.
+  Of the environment itself only the count is logged — never a variable name, never a
+  value.
+
+  Because that count describes the server's environment rather than any one command, it
+  is identical on every call and so cannot tell you which callers enforcement would break.
+  A second record, `run_command.env_referenced_withheld`, does: it is emitted only when a
+  command reads a variable the allowlist would remove, and it names them. Those names come
+  from the command text the caller wrote, not from the environment. Collecting them over a
+  representative workload gives you the `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` to set before
+  turning enforcement on.
+
+  `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` accepts exact names only. Glob patterns are refused
+  and logged rather than matched, since a prefix silently admits every future variable
+  sharing it. The PM2 IPC variables stay excluded in both modes and cannot be re-added
+  through the allowlist.
+
 - Release workflow (`.github/workflows/release.yml`): a tag push cuts a GitHub
   Release. (Was added in `72232a6` and not recorded here at the time.)
 

@@ -56,6 +56,56 @@ pm2 start homelab-ops-mcp --name homelab-ops-mcp -- --port 8282
 pm2 save
 ```
 
+### Child process environment
+
+`run_command` shells out via `bash -c`. By default the child inherits the server's
+environment, minus the PM2 IPC variables. That default is being narrowed to an explicit
+allowlist, which is safer for any deployment whose server process carries configuration
+the commands it runs have no need for.
+
+The change ships in two steps so the effect can be measured before it is switched on.
+Out of the box the server runs in **shadow mode**: behaviour is unchanged, but every
+`run_command` log record carries `env_withheld_count` — how many variables enforcement
+*would* remove.
+
+That count on its own describes the server's environment rather than any particular
+command, so it is the same on every call. The signal that tells you whether enforcement
+would actually break a caller is `run_command.env_referenced_withheld`, logged only when a
+command references a variable that enforcement would take away:
+
+```json
+{"event": "run_command.env_referenced_withheld", "names": ["MY_API_BASE"], "enforced": false}
+```
+
+Run shadow mode across a representative workload, collect the `names` from those records,
+and they are your `SYSTEM_OPS_CHILD_ENV_ALLOWLIST`. Variable *names* are reported here
+because they come from the command text the caller wrote; values are never read.
+
+The detection is deliberately approximate and errs toward over-reporting — a `$VAR` inside
+single quotes is counted even though the shell would not expand it, and an indirect read
+such as `env | grep FOO` is missed.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SYSTEM_OPS_CHILD_ENV_ENFORCE` | `false` | `true` restricts the child to the allowlist. `false` reports the count without acting on it. |
+| `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` | _(unset)_ | Comma-separated **exact** variable names to add to the base allowlist. |
+
+The base allowlist is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TZ`,
+and the POSIX `LC_*` locale variables.
+
+`SYSTEM_OPS_CHILD_ENV_ALLOWLIST` takes exact names only — glob patterns are refused and
+logged rather than matched. A pattern would silently admit every future variable that
+happens to share its prefix, which defeats the point of naming things explicitly.
+
+Commands that read configuration from disk are unaffected: a
+`source ./creds.env && …` runs the `source` *inside* the child shell, so the file is read
+after the environment is set. What stops working under enforcement is a command relying on
+a variable being ambient without sourcing it.
+
+The PM2 IPC variables (`NODE_CHANNEL_FD`, `NODE_CHANNEL_SERIALIZATION_MODE`,
+`NODE_UNIQUE_ID`) are removed in both modes and cannot be re-added through the allowlist —
+a Node.js child that inherits them aborts during teardown.
+
 ### Logging
 
 Structured JSON logs go to stderr by default. Tune via environment variables:
@@ -64,6 +114,11 @@ Structured JSON logs go to stderr by default. Tune via environment variables:
 |----------|---------|---------|
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 | `LOG_FILE` | _(unset)_ | Append logs to this path instead of stderr |
+
+`run_command.done`, `.timeout` and `.error` records carry `env_withheld_count` and
+`env_enforced`. For the environment itself only the count is recorded — never a variable
+name, never a value. The separate `run_command.env_referenced_withheld` record does carry
+names, but only ones the caller wrote into the command text.
 
 Command text and file contents are logged at `DEBUG` only; `INFO` records carry
 non-sensitive metadata (paths, cwd, exit codes).
