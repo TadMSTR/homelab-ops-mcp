@@ -64,7 +64,7 @@ def test_allowlist_extends_with_exact_names(monkeypatch):
     assert allowed >= _BASE_CHILD_ENV_ALLOWLIST
 
 
-@pytest.mark.parametrize("pattern", ["GRAFANA_*", "FOO?", "LC_[A-Z]"])
+@pytest.mark.parametrize("pattern", ["EXAMPLE_*", "FOO?", "LC_[A-Z]"])
 def test_allowlist_refuses_globs(monkeypatch, recorder, pattern):
     """A prefix would auto-promote every future key sharing it (SC-06)."""
     monkeypatch.setenv(_ALLOWLIST_ENV_VAR, pattern)
@@ -76,11 +76,16 @@ def test_allowlist_refuses_globs(monkeypatch, recorder, pattern):
 
 
 def test_allowlist_glob_does_not_match_anything(monkeypatch, enforcing):
-    """The rejected pattern must not be honoured as a pattern either."""
-    monkeypatch.setenv("GRAFANA_DS_MAIN_PASSWORD", "s3cret")
-    monkeypatch.setenv(_ALLOWLIST_ENV_VAR, "GRAFANA_*")
+    """The rejected pattern must not be honoured as a pattern either.
+
+    The variable name here is synthetic on purpose. This repo is public, and a
+    fixture is a poor place to publish the shape of any real deployment's
+    credential naming — it reads as documentation of what exists.
+    """
+    monkeypatch.setenv("EXAMPLE_DS_MAIN_PASSWORD", "s3cret")
+    monkeypatch.setenv(_ALLOWLIST_ENV_VAR, "EXAMPLE_*")
     env, _ = _child_env()
-    assert "GRAFANA_DS_MAIN_PASSWORD" not in env
+    assert "EXAMPLE_DS_MAIN_PASSWORD" not in env
 
 
 def test_base_allowlist_carries_no_secret_shaped_names():
