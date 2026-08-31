@@ -12,10 +12,30 @@ This server provides **unrestricted shell access** to the host machine. Any MCP 
 |------|-------------|
 | `run_command` | Execute a shell command (`bash -c`), returns stdout/stderr/exit_code |
 | `read_file` | Read a file by absolute path, optional `start_line`/`end_line` |
+| `read_multiple_files` | Read several files in one call; one failure does not fail the rest |
 | `write_file` | Write/overwrite a file, creates parent dirs by default |
-| `edit_file` | Find-and-replace edit — `old_str` must match exactly once |
+| `edit_file` | Find-and-replace edit — `old_str` must match exactly once; `dry_run` supported |
 | `read_directory` | List directory contents, optional recursive with `max_depth` |
 | `list_processes` | List running processes sorted by cpu/mem/pid, optional name filter |
+
+## Tool annotations
+
+Every tool publishes MCP annotations, so a client can tell a read from a write without
+maintaining a list of tool names:
+
+| Tool | readOnlyHint | idempotentHint | destructiveHint | openWorldHint |
+|---|---|---|---|---|
+| `read_file` | true | – | – | false |
+| `read_multiple_files` | true | – | – | false |
+| `read_directory` | true | – | – | false |
+| `list_processes` | true | – | – | false |
+| `write_file` | false | true | true | false |
+| `edit_file` | false | false | true | false |
+| `run_command` | false | false | true | **true** |
+
+`run_command` is the only `openWorldHint: true` tool — it runs arbitrary shell, so the
+network is reachable through it. The read-only tools omit the two write hints, which the
+spec treats as meaningless when `readOnlyHint` is true.
 
 ## Transport
 
@@ -56,6 +76,114 @@ pm2 start homelab-ops-mcp --name homelab-ops-mcp -- --port 8282
 pm2 save
 ```
 
+### Telemetry
+
+Off by default and entirely optional. The base install carries no telemetry libraries at
+all, and every backend import is lazy and guarded, so an unset variable or a missing
+package degrades to a no-op rather than an error.
+
+```bash
+pip install ".[telemetry]"
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(unset)_ | OTLP gRPC collector for traces and metrics |
+| `OTEL_SERVICE_NAME` | `homelab-ops-mcp` | Service name reported to the collector |
+| `SYSTEM_OPS_INFLUXDB3_URL` | _(unset)_ | InfluxDB 3 write endpoint |
+| `SYSTEM_OPS_INFLUXDB3_TOKEN` | _(empty)_ | InfluxDB 3 token |
+| `SYSTEM_OPS_INFLUXDB3_DATABASE` | `homelab_ops_mcp` | InfluxDB 3 database |
+| `SYSTEM_OPS_NATS_URL` | _(unset)_ | NATS server for metric events |
+| `SYSTEM_OPS_NATS_SUBJECT` | `system.ops.mcp.metrics` | NATS subject |
+
+Per tool: call count, error count, and latency. A tool that returns `{"error": ...}` counts
+as an error — these tools report failure by returning rather than raising, so counting
+exceptions alone would show a 0% error rate for a tool failing every call. A non-zero
+`exit_code` from `run_command` is *not* an error: the command failed, the tool worked.
+
+The error label is a fixed `tool_error`, never the message. The messages embed paths and
+command text, which is unbounded cardinality for a metrics backend and content that should
+not leave the host.
+
+The tools here are synchronous, so the two network sinks run on a background event loop
+this module owns. It is started lazily and only if InfluxDB or NATS is configured — with
+both unset, no thread is created.
+
+**Verifying it works.** A clean `force_flush()` return is not evidence: it returns `True`
+against an unreachable collector too. What distinguishes them is the exporter's own
+records — a wrong endpoint logs `Failed to export traces …`. Check for the absence of
+those, or better, check the service appears by name in your backend.
+
+### Output limits
+
+`run_command` captures at most `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB) from
+stdout and from stderr, counted separately. If either stream reaches the cap the child's
+process group is killed, the captured output carries an explicit `[truncated: …]` marker,
+and the response sets `truncated: true`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` | `1048576` | Per-stream capture cap, in bytes |
+
+`truncated` is present on every `run_command` response, so a capped result is
+distinguishable from a genuinely short one. Output is read incrementally rather than
+buffered to EOF, so a command producing gigabytes is stopped rather than held in memory
+first.
+
+The child runs in its own session and is killed by process group, so the whole pipeline
+goes rather than just the `bash` that spawned it. The timeout path gets the same
+treatment — previously a timeout killed `bash` and left its children running.
+
+### Child process environment
+
+`run_command` shells out via `bash -c`. By default the child inherits the server's
+environment, minus the PM2 IPC variables. That default is being narrowed to an explicit
+allowlist, which is safer for any deployment whose server process carries configuration
+the commands it runs have no need for.
+
+The change ships in two steps so the effect can be measured before it is switched on.
+Out of the box the server runs in **shadow mode**: behaviour is unchanged, but every
+`run_command` log record carries `env_withheld_count` — how many variables enforcement
+*would* remove.
+
+That count on its own describes the server's environment rather than any particular
+command, so it is the same on every call. The signal that tells you whether enforcement
+would actually break a caller is `run_command.env_referenced_withheld`, logged only when a
+command references a variable that enforcement would take away:
+
+```json
+{"event": "run_command.env_referenced_withheld", "names": ["MY_API_BASE"], "enforced": false}
+```
+
+Run shadow mode across a representative workload, collect the `names` from those records,
+and they are your `SYSTEM_OPS_CHILD_ENV_ALLOWLIST`. Variable *names* are reported here
+because they come from the command text the caller wrote; values are never read.
+
+The detection is deliberately approximate and errs toward over-reporting — a `$VAR` inside
+single quotes is counted even though the shell would not expand it, and an indirect read
+such as `env | grep FOO` is missed.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SYSTEM_OPS_CHILD_ENV_ENFORCE` | `false` | `true` restricts the child to the allowlist. `false` reports the count without acting on it. |
+| `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` | _(unset)_ | Comma-separated **exact** variable names to add to the base allowlist. |
+
+The base allowlist is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TZ`,
+and the POSIX `LC_*` locale variables.
+
+`SYSTEM_OPS_CHILD_ENV_ALLOWLIST` takes exact names only — glob patterns are refused and
+logged rather than matched. A pattern would silently admit every future variable that
+happens to share its prefix, which defeats the point of naming things explicitly.
+
+Commands that read configuration from disk are unaffected: a
+`source ./creds.env && …` runs the `source` *inside* the child shell, so the file is read
+after the environment is set. What stops working under enforcement is a command relying on
+a variable being ambient without sourcing it.
+
+The PM2 IPC variables (`NODE_CHANNEL_FD`, `NODE_CHANNEL_SERIALIZATION_MODE`,
+`NODE_UNIQUE_ID`) are removed in both modes and cannot be re-added through the allowlist —
+a Node.js child that inherits them aborts during teardown.
+
 ### Logging
 
 Structured JSON logs go to stderr by default. Tune via environment variables:
@@ -65,8 +193,25 @@ Structured JSON logs go to stderr by default. Tune via environment variables:
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 | `LOG_FILE` | _(unset)_ | Append logs to this path instead of stderr |
 
+`run_command.done`, `.timeout` and `.error` records carry `env_withheld_count` and
+`env_enforced`. For the environment itself only the count is recorded — never a variable
+name, never a value. The separate `run_command.env_referenced_withheld` record does carry
+names, but only ones the caller wrote into the command text.
+
 Command text and file contents are logged at `DEBUG` only; `INFO` records carry
 non-sensitive metadata (paths, cwd, exit codes).
+
+Everything on the stream is JSON, including records from uvicorn, fastmcp and the MCP SDK
+— they are routed through the same processor chain rather than writing plain text
+alongside it. Each record carries a `logger` field naming its source, so this server's own
+events and a library's are distinguishable.
+
+uvicorn's per-request access log is off. It was one line per request with the request
+volume being entirely MCP tool traffic, and it said nothing the per-tool events do not.
+uvicorn *errors* still log.
+
+There is no rotation built in — point `LOG_FILE` at a path your log rotation already
+covers. The handle is opened in append mode, so a `copytruncate`-style rotation is safe.
 
 ## Development
 

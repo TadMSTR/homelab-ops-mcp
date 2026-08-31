@@ -1,5 +1,150 @@
 # Changelog
 
+## [0.3.0] — 2026-08-31
+
+Two behaviour changes worth reading before upgrading:
+
+1. **Paths must be absolute.** `read_file`, `read_multiple_files`, `write_file`,
+   `edit_file`, `read_directory` and `run_command`'s `cwd` now reject anything else. A
+   caller passing `~/notes/x.md` previously got a success response and a file written
+   somewhere else entirely.
+2. **`run_command` output is capped** at 1 MiB per stream by default, and responses carry a
+   new `truncated` field.
+
+The child-environment allowlist is *not* a behaviour change on upgrade — it ships off, in
+shadow mode. See below.
+
+
+### Fixed
+
+- **File tools silently mis-wrote tilde paths.** `read_file`, `write_file`,
+  `edit_file` and `read_directory` passed their `path` argument straight to
+  `Path()`, which does no tilde expansion. A path like `~/notes/x.md` is therefore
+  not absolute, so it resolved against the server's working directory: the tool
+  created a literal `~` directory tree there and returned success. All four tools
+  now validate that `path` is absolute and reject it otherwise, with the offending
+  path echoed in the error. A separate backstop refuses any path whose components
+  include a literal `~`, even when the path as a whole is absolute.
+
+  Rejecting rather than expanding is deliberate — every one of these tools already
+  documented its argument as "Absolute path to the file", so this enforces the
+  stated contract instead of quietly widening it.
+
+  `run_command`'s `cwd` argument gets the same validation, and now fails before
+  spawning a shell rather than surfacing a bare `ENOENT`. Tilde paths *inside* the
+  command string are untouched; those go through bash, which expands them correctly.
+
+### Added
+
+- **Child process environment allowlist for `run_command`.** The environment handed to
+  a shelled-out child can now be restricted to an explicit allowlist —
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TZ` and the POSIX `LC_*`
+  variables — extended with exact names via `SYSTEM_OPS_CHILD_ENV_ALLOWLIST`. Previously
+  the child inherited the server's whole environment apart from three PM2 IPC variables,
+  which meant anything the server was started with reached every command it ran, whether
+  or not that command had any use for it.
+
+  It ships **off by default**, in shadow mode: behaviour is unchanged, but
+  `run_command`'s `.done`, `.timeout` and `.error` log records now carry
+  `env_withheld_count` (how many variables enforcement would remove) and `env_enforced`.
+  Of the environment itself only the count is logged — never a variable name, never a
+  value.
+
+  Because that count describes the server's environment rather than any one command, it
+  is identical on every call and so cannot tell you which callers enforcement would break.
+  A second record, `run_command.env_referenced_withheld`, does: it is emitted only when a
+  command reads a variable the allowlist would remove, and it names them. Those names come
+  from the command text the caller wrote, not from the environment. Collecting them over a
+  representative workload gives you the `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` to set before
+  turning enforcement on.
+
+  `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` accepts exact names only. Glob patterns are refused
+  and logged rather than matched, since a prefix silently admits every future variable
+  sharing it. The PM2 IPC variables stay excluded in both modes and cannot be re-added
+  through the allowlist.
+
+- **`read_multiple_files(paths)`** — read several files in one call. Each path gets its own
+  result, so one bad path does not fail the rest, and the response carries `ok`/`failed`
+  counts. `read_file` was the second most-called tool here and agents were paying a round
+  trip per file.
+
+- **`dry_run` on `edit_file`** — reports what the edit would do, including the size change,
+  and writes nothing. `dry_run` is on every `edit_file` response so its absence and its
+  falsity are not the same thing.
+
+- **Closest-match feedback on a failed `edit_file`.** A failed match returned only a count,
+  which says something is wrong but not what — and an agent faced with that tends to
+  abandon the edit and rewrite the whole file, a far larger and riskier write than the one
+  it was attempting. The response now carries the most similar passage in the file, its line
+  number, a similarity score, and an `ndiff` whose `?` lines mark the differing *characters*.
+  Nothing is reported when the file is over 2 MiB or when nothing resembles the request
+  closely enough to be worth quoting — a confident wrong guess is worse than none.
+
+- **`execution_time`** on every `run_command` response — wall-clock seconds, on the success,
+  timeout and error paths alike.
+
+- **Optional telemetry** (`telemetry.py`, `[telemetry]` extra). OTLP traces and metrics,
+  plus InfluxDB 3 and NATS sinks, each gated on its own environment variable and all off by
+  default. No telemetry library is in the base dependencies and every backend import is
+  lazy and guarded, so the base install is unaffected. Per tool: call count, error count
+  and latency.
+
+  A tool returning `{"error": ...}` counts as an error — these tools report failure by
+  returning rather than raising, so counting exceptions alone would report a 0% error rate
+  for a tool failing every call. A non-zero `exit_code` from `run_command` is not an error.
+  The error label is a fixed `tool_error` rather than the message, which would be unbounded
+  cardinality and would carry paths and command text off the host.
+
+  The tools are synchronous, so the two network sinks run on a background event loop the
+  module owns, started lazily and only when one of them is configured.
+
+- **Tool annotations on all six tools.** `list_tools` now returns `readOnlyHint`,
+  `destructiveHint`, `idempotentHint` and `openWorldHint`, so a client can distinguish a
+  read from a write without matching on tool names. `read_file`, `read_directory` and
+  `list_processes` are read-only; `write_file`, `edit_file` and `run_command` are
+  destructive. `write_file` is idempotent and `edit_file` is not — a second identical edit
+  finds no match and fails.
+
+  `run_command` is the only tool with `openWorldHint: true`: it executes arbitrary shell,
+  so the network is inside its envelope. The read-only tools omit `destructiveHint` and
+  `idempotentHint` entirely, which the spec treats as meaningless when `readOnlyHint` is
+  true.
+
+- **Per-stream output cap on `run_command`.** stdout and stderr are each captured up to
+  `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB). Output is now read incrementally
+  instead of buffered to EOF, so a command producing far more than that is stopped rather
+  than held in memory and then handed to the caller in full. On a breach the response sets
+  `truncated: true` and the captured text carries an explicit `[truncated: …]` marker —
+  `truncated` is present on every response so a capped result can be told apart from a
+  short one.
+
+- Release workflow (`.github/workflows/release.yml`): a tag push cuts a GitHub
+  Release. (Was added in `72232a6` and not recorded here at the time.)
+
+### Changed
+
+- **The log stream is now JSON end to end.** Records from uvicorn, fastmcp and the MCP SDK
+  go through the same structlog processor chain as this server's own events instead of
+  being written as plain text beside them, and every record carries a `logger` field
+  naming its source. fastmcp sets `propagate = False` on its logger and attaches Rich
+  handlers, which also meant its exception tracebacks — the records that matter most when
+  something is wrong — never reached the JSON stream at all; that logger is now reclaimed.
+
+- **uvicorn's per-request access log is off.** One line per request, on a server whose
+  request volume is entirely MCP tool traffic, saying nothing the per-tool events do not
+  already record. Measured on one rotated day-file: 154,109 access lines against 15,089
+  structured events, so 91% of the file was untyped noise. uvicorn *errors* still log.
+
+- The FastMCP startup banner is suppressed — 18 lines of ASCII art per start, on a
+  headless service whose log is read with `grep`.
+
+- `run_command` now kills the child by process group rather than killing `bash` alone.
+  A timeout previously reaped the shell but left the commands it had spawned running.
+
+- `ecosystem.config.js` now declares its `env` block explicitly rather than omitting
+  it, so "no environment" reads as an assertion instead of an accident. (Was changed
+  in `acc8c35` and not recorded here at the time.)
+
 ## [0.2.1] — 2026-07-20
 
 ### Security

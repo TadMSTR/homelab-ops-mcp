@@ -4,12 +4,13 @@ MCP server that gives AI agents shell access, file read/write, and process inspe
 
 ## What it does
 
-Exposes six tools:
+Exposes seven tools:
 
-- **`run_command`** — executes arbitrary shell commands via `bash -c`, returns stdout/stderr/exit code
+- **`run_command`** — executes arbitrary shell commands via `bash -c`, returns stdout/stderr/exit code, `execution_time`, and a `truncated` flag
 - **`read_file`** — reads a file with optional line range
+- **`read_multiple_files`** — reads several files in one call; a failing path does not fail the rest
 - **`write_file`** — overwrites a file (creates parent dirs by default)
-- **`edit_file`** — find-and-replace edit; `old_str` must match exactly once
+- **`edit_file`** — find-and-replace edit; `old_str` must match exactly once. Supports `dry_run`, and reports the closest passage with a diff when nothing matches
 - **`read_directory`** — lists directory contents, optionally recursive
 - **`list_processes`** — lists running processes sorted by CPU, memory, or PID
 
@@ -24,8 +25,15 @@ server.py         # Root shim → homelab_ops_mcp.server:main (backward-compat)
 tests/            # pytest suite (~96% coverage)
 ```
 
-All settings come from CLI args (`--host`, `--port`, `--path`) or the logging env
-vars — no config file. See `ARCHITECTURE.md` for detail.
+All settings come from CLI args (`--host`, `--port`, `--path`) or environment
+variables — no config file. The env vars are `LOG_LEVEL` and `LOG_FILE` for logging,
+and `SYSTEM_OPS_CHILD_ENV_ENFORCE` / `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` for the
+environment handed to `run_command`'s children (see README). Every one has a safe
+in-code default. See `ARCHITECTURE.md` for detail.
+
+Paths passed to the file tools and to `run_command`'s `cwd` must be absolute. They are
+rejected otherwise — `Path()` does no tilde expansion, so a `~/...` path would resolve
+against the process working directory instead.
 
 ## Running locally
 

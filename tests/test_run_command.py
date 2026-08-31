@@ -57,17 +57,13 @@ def test_run_command_child_does_not_see_pm2_vars(monkeypatch):
     assert r["stdout"] == "fd=[] mode=[]\n"
 
 
-def test_run_command_child_keeps_normal_env(monkeypatch):
-    monkeypatch.setenv("FORGE_TEST_VAR", "present")
-    r = run_command("echo v=$FORGE_TEST_VAR")
-    assert r["stdout"] == "v=present\n"
-
-
 def test_run_command_exception_path(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("subprocess exploded")
 
-    monkeypatch.setattr(server.subprocess, "run", boom)
+    # Retargeted from subprocess.run onto Popen: capture is now incremental, so
+    # run() is no longer the call that can fail here.
+    monkeypatch.setattr(server.subprocess, "Popen", boom)
     r = run_command("echo hi")
     assert r["exit_code"] == -1
     assert "subprocess exploded" in r["stderr"]

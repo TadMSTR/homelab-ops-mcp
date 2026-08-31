@@ -9,32 +9,69 @@ module.exports = {
       cwd: "/home/ted/repos/personal/homelab-ops-mcp",
       interpreter: "none",
 
-      // Empty ON PURPOSE — this server requires nothing from the environment.
-      // The only two variables the source reads are LOG_LEVEL and LOG_FILE
-      // (src/homelab_ops_mcp/logging.py). Both are unset in the running
-      // process and both have safe in-code defaults: INFO, and stderr. Host
-      // and port are passed explicitly as `args` above.
+      // Declared explicitly, and deliberately minimal.
       //
-      // This one is worth spelling out because the running process carries far
-      // more environment than any other app declared in this repo — a large
-      // inherited bundle plus a stray API token, none of which it reads. That
-      // is a side effect of having been started by hand from an interactive
-      // shell, which freezes the whole shell environment into PM2's dump. It
-      // is not configuration, and reproducing it would be actively harmful:
-      // it would put credentials into a process that ignores them, and PM2
-      // would write them straight back out at the next `pm2 save`.
+      // The server reads four variables, all with safe in-code defaults:
+      // LOG_LEVEL (INFO), LOG_FILE (stderr), SYSTEM_OPS_CHILD_ENV_ENFORCE
+      // (false) and SYSTEM_OPS_CHILD_ENV_ALLOWLIST (empty). Host and port are
+      // passed as `args` above, not through the environment.
       //
-      // Stated explicitly rather than omitted so that "no env block" can no
-      // longer be read two ways. A declaration silent about env is
-      // indistinguishable from one where the env was lost, and that ambiguity
-      // is what made this app unsafe to `pm2 delete` and re-create even though
-      // it was already declared here.
+      // SYSTEM_OPS_CHILD_ENV_ENFORCE is pinned to "false" rather than left
+      // unset even though false is the in-code default. `pm2 restart
+      // --update-env` can change a variable but cannot delete one, so a
+      // variable that is present from the start can be flipped back; one that
+      // was never declared can only be removed by `pm2 delete` + `pm2 start`
+      // from a shell that does not have it set. Declaring it now is what makes
+      // the rollback a one-line edit later.
+      //
+      // Worth spelling out because the running process carries far more
+      // environment than this block declares — a large inherited bundle plus a
+      // stray API token, none of which the server reads. That is a side effect
+      // of having been started by hand from an interactive shell, which freezes
+      // the whole shell environment into PM2's dump. It is not configuration,
+      // and reproducing it would be actively harmful: it would put credentials
+      // into a process that ignores them, and PM2 would write them straight
+      // back out at the next `pm2 save`.
       //
       // Note this does not scrub inheritance: PM2 always passes the parent
       // environment through, so a `pm2 start` from an interactive shell still
       // inherits whatever that shell sourced. What this block asserts is what
-      // the app *requires*, which is nothing.
-      env: {},
+      // the app *requires*.
+      env: {
+        SYSTEM_OPS_CHILD_ENV_ENFORCE: "false",
+        // Set explicitly rather than relying on PM2 capturing stderr. With it
+        // set, the server writes its own JSON stream to this file and stderr
+        // carries nothing, so there is one writer and one format.
+        //
+        // Deliberately the same path as out_file/error_file below: the file is
+        // already covered by /etc/logrotate.d/forge-logs
+        // (/home/ted/logs/[!b]*.log, daily, rotate 14, copytruncate), and a
+        // second path would need a second logrotate claim. The handle is opened
+        // in append mode, which is what makes copytruncate safe — writes resume
+        // at the new end of file rather than leaving a sparse gap.
+        //
+        // Do NOT add pm2-logrotate. It is not installed, and a second mechanism
+        // would double-claim these files, which logrotate treats as a hard
+        // error that fails the whole daily run.
+        LOG_FILE: "/home/ted/logs/system-ops.log",
+
+        // Telemetry. Only OTLP is enabled; the InfluxDB and NATS sinks stay
+        // unset, so telemetry.py never starts its background loop thread.
+        //
+        // 127.0.0.1:4317 is the SigNoz collector's gRPC port. Taken from
+        // dockhand-mcp, another host-side PM2 MCP server, which uses this exact
+        // endpoint and does appear in SigNoz — so it is proven from this
+        // deployment shape rather than merely reachable.
+        //
+        // Not INFLUXDB_URL from forge.env: that name holds a container-network
+        // address host processes cannot resolve, and port 8181 on this host is
+        // qmd. See vikunja#575.
+        OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:4317",
+        // The PM2 app name, so the service is findable in SigNoz under the name
+        // an operator already uses for it. The package default is
+        // "homelab-ops-mcp".
+        OTEL_SERVICE_NAME: "system-ops",
+      },
 
       restart_delay: 5000,
       max_restarts: 10,
