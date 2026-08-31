@@ -54,6 +54,23 @@ module.exports = {
         // would double-claim these files, which logrotate treats as a hard
         // error that fails the whole daily run.
         LOG_FILE: "/home/ted/logs/system-ops.log",
+
+        // Telemetry. Only OTLP is enabled; the InfluxDB and NATS sinks stay
+        // unset, so telemetry.py never starts its background loop thread.
+        //
+        // 127.0.0.1:4317 is the SigNoz collector's gRPC port. Taken from
+        // dockhand-mcp, another host-side PM2 MCP server, which uses this exact
+        // endpoint and does appear in SigNoz — so it is proven from this
+        // deployment shape rather than merely reachable.
+        //
+        // Not INFLUXDB_URL from forge.env: that name holds a container-network
+        // address host processes cannot resolve, and port 8181 on this host is
+        // qmd. See vikunja#575.
+        OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:4317",
+        // The PM2 app name, so the service is findable in SigNoz under the name
+        // an operator already uses for it. The package default is
+        // "homelab-ops-mcp".
+        OTEL_SERVICE_NAME: "system-ops",
       },
 
       restart_delay: 5000,

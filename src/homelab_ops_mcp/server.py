@@ -7,6 +7,7 @@ and list_processes. All server logic lives here; see ARCHITECTURE.md for the lay
 """
 
 import contextlib
+import functools
 import os
 import re
 import selectors
@@ -20,6 +21,7 @@ import psutil
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from . import telemetry
 from .logging import configure_logging, tame_library_logging
 
 log = configure_logging()
@@ -163,6 +165,32 @@ def _child_env() -> tuple[dict, int]:
     kept = {k: v for k, v in parent.items() if k in allowed}
     withheld = len(parent) - len(kept)
     return (kept if _child_env_enforced() else parent), withheld
+
+
+def _instrumented(fn):
+    """Time every call to a tool and record its outcome as telemetry.
+
+    These tools report failure by *returning* ``{"error": ...}`` rather than by
+    raising, so the wrapper inspects the returned value. Counting only
+    exceptions would report a 0% error rate for a tool failing every call.
+
+    The label is a fixed ``tool_error`` rather than the message: the messages
+    embed paths and command text, which is both unbounded cardinality for a
+    metrics backend and content that has no business leaving the host.
+
+    A non-zero ``exit_code`` from ``run_command`` is deliberately not an error.
+    The command failed; the tool worked.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with telemetry.record_tool_call(fn.__name__) as outcome:
+            result = fn(*args, **kwargs)
+            if isinstance(result, dict) and result.get("error"):
+                outcome["error"] = "tool_error"
+            return result
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +362,7 @@ def _mark_truncated(text: str, limit: int) -> str:
         open_world_hint=True,
     )
 )
+@_instrumented
 def run_command(
     command: str,
     cwd: str | None = None,
@@ -432,6 +461,7 @@ def run_command(
 # read_file
 # ---------------------------------------------------------------------------
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@_instrumented
 def read_file(
     path: str,
     start_line: int | None = None,
@@ -493,6 +523,7 @@ def read_file(
         open_world_hint=False,
     )
 )
+@_instrumented
 def write_file(
     path: str,
     content: str,
@@ -535,6 +566,7 @@ def write_file(
         open_world_hint=False,
     )
 )
+@_instrumented
 def edit_file(
     path: str,
     old_str: str,
@@ -583,6 +615,7 @@ def edit_file(
 # read_directory
 # ---------------------------------------------------------------------------
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@_instrumented
 def read_directory(
     path: str,
     recursive: bool = False,
@@ -636,6 +669,7 @@ def read_directory(
 # list_processes
 # ---------------------------------------------------------------------------
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+@_instrumented
 def list_processes(
     sort_by: str = "cpu",
     limit: int = 30,
@@ -701,6 +735,7 @@ def main() -> None:
     args = parser.parse_args()
 
     tame_library_logging()
+    telemetry.init()
     log.info("server.start", host=args.host, port=args.port, path=args.path)
     mcp.run(  # pragma: no cover
         transport="streamable-http",

@@ -74,6 +74,44 @@ pm2 start homelab-ops-mcp --name homelab-ops-mcp -- --port 8282
 pm2 save
 ```
 
+### Telemetry
+
+Off by default and entirely optional. The base install carries no telemetry libraries at
+all, and every backend import is lazy and guarded, so an unset variable or a missing
+package degrades to a no-op rather than an error.
+
+```bash
+pip install ".[telemetry]"
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(unset)_ | OTLP gRPC collector for traces and metrics |
+| `OTEL_SERVICE_NAME` | `homelab-ops-mcp` | Service name reported to the collector |
+| `SYSTEM_OPS_INFLUXDB3_URL` | _(unset)_ | InfluxDB 3 write endpoint |
+| `SYSTEM_OPS_INFLUXDB3_TOKEN` | _(empty)_ | InfluxDB 3 token |
+| `SYSTEM_OPS_INFLUXDB3_DATABASE` | `homelab_ops_mcp` | InfluxDB 3 database |
+| `SYSTEM_OPS_NATS_URL` | _(unset)_ | NATS server for metric events |
+| `SYSTEM_OPS_NATS_SUBJECT` | `system.ops.mcp.metrics` | NATS subject |
+
+Per tool: call count, error count, and latency. A tool that returns `{"error": ...}` counts
+as an error — these tools report failure by returning rather than raising, so counting
+exceptions alone would show a 0% error rate for a tool failing every call. A non-zero
+`exit_code` from `run_command` is *not* an error: the command failed, the tool worked.
+
+The error label is a fixed `tool_error`, never the message. The messages embed paths and
+command text, which is unbounded cardinality for a metrics backend and content that should
+not leave the host.
+
+The tools here are synchronous, so the two network sinks run on a background event loop
+this module owns. It is started lazily and only if InfluxDB or NATS is configured — with
+both unset, no thread is created.
+
+**Verifying it works.** A clean `force_flush()` return is not evidence: it returns `True`
+against an unreachable collector too. What distinguishes them is the exporter's own
+records — a wrong endpoint logs `Failed to export traces …`. Check for the absence of
+those, or better, check the service appears by name in your backend.
+
 ### Output limits
 
 `run_command` captures at most `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB) from

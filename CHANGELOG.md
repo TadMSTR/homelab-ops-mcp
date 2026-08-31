@@ -50,6 +50,21 @@
   sharing it. The PM2 IPC variables stay excluded in both modes and cannot be re-added
   through the allowlist.
 
+- **Optional telemetry** (`telemetry.py`, `[telemetry]` extra). OTLP traces and metrics,
+  plus InfluxDB 3 and NATS sinks, each gated on its own environment variable and all off by
+  default. No telemetry library is in the base dependencies and every backend import is
+  lazy and guarded, so the base install is unaffected. Per tool: call count, error count
+  and latency.
+
+  A tool returning `{"error": ...}` counts as an error — these tools report failure by
+  returning rather than raising, so counting exceptions alone would report a 0% error rate
+  for a tool failing every call. A non-zero `exit_code` from `run_command` is not an error.
+  The error label is a fixed `tool_error` rather than the message, which would be unbounded
+  cardinality and would carry paths and command text off the host.
+
+  The tools are synchronous, so the two network sinks run on a background event loop the
+  module owns, started lazily and only when one of them is configured.
+
 - **Tool annotations on all six tools.** `list_tools` now returns `readOnlyHint`,
   `destructiveHint`, `idempotentHint` and `openWorldHint`, so a client can distinguish a
   read from a write without matching on tool names. `read_file`, `read_directory` and
