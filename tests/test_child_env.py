@@ -20,28 +20,6 @@ from homelab_ops_mcp.server import (
 )
 
 
-class _Recorder:
-    """Stands in for the module logger and keeps every event's kwargs."""
-
-    def __init__(self):
-        self.events = []
-
-    def _record(self, event, **kw):
-        self.events.append((event, kw))
-
-    debug = info = warning = error = _record
-
-    def of(self, event):
-        return [kw for name, kw in self.events if name == event]
-
-
-@pytest.fixture()
-def recorder(monkeypatch):
-    r = _Recorder()
-    monkeypatch.setattr(server, "log", r)
-    return r
-
-
 @pytest.fixture()
 def shadow(monkeypatch):
     monkeypatch.delenv(_ENFORCE_ENV_VAR, raising=False)
@@ -245,7 +223,7 @@ def test_error_logs_withheld_count(monkeypatch, recorder, shadow):
     def boom(*a, **k):
         raise RuntimeError("subprocess exploded")
 
-    monkeypatch.setattr(server.subprocess, "run", boom)
+    monkeypatch.setattr(server.subprocess, "Popen", boom)
     run_command("echo hi")
     (kw,) = recorder.of("run_command.error")
     assert kw["env_withheld_count"] > 0

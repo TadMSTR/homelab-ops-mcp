@@ -56,6 +56,26 @@ pm2 start homelab-ops-mcp --name homelab-ops-mcp -- --port 8282
 pm2 save
 ```
 
+### Output limits
+
+`run_command` captures at most `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB) from
+stdout and from stderr, counted separately. If either stream reaches the cap the child's
+process group is killed, the captured output carries an explicit `[truncated: …]` marker,
+and the response sets `truncated: true`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` | `1048576` | Per-stream capture cap, in bytes |
+
+`truncated` is present on every `run_command` response, so a capped result is
+distinguishable from a genuinely short one. Output is read incrementally rather than
+buffered to EOF, so a command producing gigabytes is stopped rather than held in memory
+first.
+
+The child runs in its own session and is killed by process group, so the whole pipeline
+goes rather than just the `bash` that spawned it. The timeout path gets the same
+treatment — previously a timeout killed `bash` and left its children running.
+
 ### Child process environment
 
 `run_command` shells out via `bash -c`. By default the child inherits the server's

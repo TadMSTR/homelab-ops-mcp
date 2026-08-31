@@ -50,10 +50,21 @@
   sharing it. The PM2 IPC variables stay excluded in both modes and cannot be re-added
   through the allowlist.
 
+- **Per-stream output cap on `run_command`.** stdout and stderr are each captured up to
+  `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB). Output is now read incrementally
+  instead of buffered to EOF, so a command producing far more than that is stopped rather
+  than held in memory and then handed to the caller in full. On a breach the response sets
+  `truncated: true` and the captured text carries an explicit `[truncated: …]` marker —
+  `truncated` is present on every response so a capped result can be told apart from a
+  short one.
+
 - Release workflow (`.github/workflows/release.yml`): a tag push cuts a GitHub
   Release. (Was added in `72232a6` and not recorded here at the time.)
 
 ### Changed
+
+- `run_command` now kills the child by process group rather than killing `bash` alone.
+  A timeout previously reaped the shell but left the commands it had spawned running.
 
 - `ecosystem.config.js` now declares its `env` block explicitly rather than omitting
   it, so "no environment" reads as an assertion instead of an accident. (Was changed

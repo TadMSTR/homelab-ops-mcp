@@ -9,8 +9,11 @@ and list_processes. All server logic lives here; see ARCHITECTURE.md for the lay
 import contextlib
 import os
 import re
+import selectors
+import signal
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import psutil
@@ -213,6 +216,111 @@ def _atomic_write(path: Path, content: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Bounded output capture
+# ---------------------------------------------------------------------------
+_OUTPUT_LIMIT_ENV_VAR = "SYSTEM_OPS_OUTPUT_LIMIT_BYTES"
+_DEFAULT_OUTPUT_LIMIT = 1024 * 1024  # 1 MiB per stream
+_READ_CHUNK = 65536
+
+
+def _output_limit() -> int:
+    """Per-stream capture cap in bytes, from the environment or the default."""
+    raw = os.environ.get(_OUTPUT_LIMIT_ENV_VAR, "").strip()
+    if not raw:
+        return _DEFAULT_OUTPUT_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("output_limit.invalid", value=raw)
+        return _DEFAULT_OUTPUT_LIMIT
+    if value <= 0:
+        log.warning("output_limit.invalid", value=raw)
+        return _DEFAULT_OUTPUT_LIMIT
+    return value
+
+
+def _run_capped(command: str, cwd: str, env: dict, timeout: int, limit: int) -> tuple:
+    """Run ``command`` under bash, capturing at most ``limit`` bytes per stream.
+
+    ``subprocess.run(capture_output=True)`` reads both pipes to EOF with no
+    bound, so one ``cat`` of a large file lands whole in this process's memory
+    and then whole in the caller's context. Read incrementally instead and stop
+    the process as soon as either stream passes the cap.
+
+    Returns ``(stdout, stderr, exit_code, truncated, timed_out)``. On a cap
+    breach or a timeout the process group is killed and reaped before returning,
+    so nothing is left behind.
+
+    The child gets its own session, so the kill reaches the whole pipeline
+    rather than just the ``bash`` that spawned it. Without that, killing bash
+    leaves its children running — which was already true of the timeout path
+    when it used ``subprocess.run``.
+    """
+    proc = subprocess.Popen(
+        ["bash", "-c", command],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    buffers = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    truncated = False
+    timed_out = False
+    deadline = time.monotonic() + timeout
+
+    sel = selectors.DefaultSelector()
+    try:
+        for stream in buffers:
+            sel.register(stream, selectors.EVENT_READ)
+        while sel.get_map() and not truncated:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in sel.select(timeout=min(remaining, 0.2)):
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), _READ_CHUNK)
+                if not chunk:
+                    sel.unregister(stream)
+                    continue
+                buf = buffers[stream]
+                if len(buf) < limit:
+                    buf.extend(chunk[: limit - len(buf)])
+                if len(buf) >= limit:
+                    truncated = True
+    finally:
+        sel.close()
+
+    if truncated or timed_out:
+        _kill_group(proc)
+    exit_code = proc.wait()
+    for stream in buffers:
+        stream.close()
+
+    return (
+        buffers[proc.stdout].decode(errors="replace"),
+        buffers[proc.stderr].decode(errors="replace"),
+        exit_code,
+        truncated,
+        timed_out,
+    )
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the child's whole process group, tolerating an already-dead child."""
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+
+
+def _mark_truncated(text: str, limit: int) -> str:
+    """Append an explicit marker so truncation is distinguishable from brevity."""
+    return f"{text}\n[truncated: output reached the {limit}-byte per-stream cap]"
+
+
+# ---------------------------------------------------------------------------
 # run_command
 # ---------------------------------------------------------------------------
 @mcp.tool
@@ -227,6 +335,10 @@ def run_command(
         command: Shell command to run (executed via bash -c).
         cwd: Working directory for the command. Defaults to the home directory.
         timeout: Max seconds to wait before killing the process (default 30).
+
+    Each stream is captured up to SYSTEM_OPS_OUTPUT_LIMIT_BYTES (default 1 MiB).
+    If either reaches the cap the process is killed and ``truncated`` is true,
+    so a capped result is distinguishable from a genuinely short one.
     """
     working_dir = cwd or str(Path.home())
     # Only the working directory is validated. Tilde paths *inside* ``command``
@@ -251,39 +363,49 @@ def run_command(
         )
     # Command text is sensitive; log it at DEBUG only.
     log.debug("run_command.start", cwd=working_dir, timeout=timeout, command=command)
+    limit = _output_limit()
     try:
-        result = subprocess.run(
-            ["bash", "-c", command],
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=child_env,
+        stdout, stderr, exit_code, truncated, timed_out = _run_capped(
+            command, working_dir, child_env, timeout, limit
         )
+        if timed_out:
+            log.warning(
+                "run_command.timeout",
+                cwd=working_dir,
+                timeout=timeout,
+                env_withheld_count=withheld,
+                env_enforced=enforced,
+            )
+            return {
+                "stdout": stdout,
+                "stderr": f"Command timed out after {timeout} seconds.",
+                "exit_code": -1,
+                "truncated": truncated,
+            }
+        if truncated:
+            if len(stdout.encode(errors="replace")) >= limit:
+                stdout = _mark_truncated(stdout, limit)
+            if len(stderr.encode(errors="replace")) >= limit:
+                stderr = _mark_truncated(stderr, limit)
+            log.warning(
+                "run_command.truncated",
+                cwd=working_dir,
+                limit_bytes=limit,
+                env_withheld_count=withheld,
+                env_enforced=enforced,
+            )
         log.info(
             "run_command.done",
             cwd=working_dir,
-            exit_code=result.returncode,
+            exit_code=exit_code,
             env_withheld_count=withheld,
             env_enforced=enforced,
         )
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "run_command.timeout",
-            cwd=working_dir,
-            timeout=timeout,
-            env_withheld_count=withheld,
-            env_enforced=enforced,
-        )
-        return {
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout} seconds.",
-            "exit_code": -1,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "truncated": truncated,
         }
     except Exception as e:
         log.error(
@@ -293,7 +415,7 @@ def run_command(
             env_withheld_count=withheld,
             env_enforced=enforced,
         )
-        return {"stdout": "", "stderr": str(e), "exit_code": -1}
+        return {"stdout": "", "stderr": str(e), "exit_code": -1, "truncated": False}
 
 
 # ---------------------------------------------------------------------------
