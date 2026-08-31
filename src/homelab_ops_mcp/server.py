@@ -1,10 +1,25 @@
 """homelab-ops-mcp — Shell and file access MCP server for the homelab ops agent.
 
-Transport: streamable-http on 0.0.0.0:<port>/mcp
+Transport: streamable-http on 127.0.0.1:<port>/mcp by default. The bind host is
+loopback unless ``--host`` says otherwise; see ``main()`` and SECURITY.md.
 
 Exposes seven tools: run_command, read_file, read_multiple_files, write_file,
 edit_file, read_directory, and list_processes. All server logic lives here; see
 ARCHITECTURE.md for the layout.
+
+SECURITY[accepted]: tools return the underlying error text (``str(e)``, OS error
+strings, offending paths) rather than a generic message. That is normally a
+disclosure concern (OE-02), and it is deliberate here. This server's entire
+contract is arbitrary shell execution and unrestricted filesystem access for the
+caller, so there is nothing an error message can disclose that the caller cannot
+read directly with the tools themselves. Suppressing the detail would cost real
+diagnosability and buy no confidentiality. The controls that do the work are the
+loopback bind and the network boundary, not the error text.
+
+The environment is the exception to that, and it is handled separately: the
+withheld-variable logging records counts only, never a name and never a value,
+and the referenced-variable log carries only names the caller itself wrote into
+the command text. Pinned by test.
 """
 
 import contextlib
