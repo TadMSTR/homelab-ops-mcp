@@ -18,6 +18,7 @@ from pathlib import Path
 
 import psutil
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from .logging import configure_logging
 
@@ -323,7 +324,16 @@ def _mark_truncated(text: str, limit: int) -> str:
 # ---------------------------------------------------------------------------
 # run_command
 # ---------------------------------------------------------------------------
-@mcp.tool
+@mcp.tool(
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        idempotent_hint=False,
+        destructive_hint=True,
+        # The only tool here that can reach the network: it runs arbitrary
+        # shell, so curl, git push and apt are all inside its envelope.
+        open_world_hint=True,
+    )
+)
 def run_command(
     command: str,
     cwd: str | None = None,
@@ -421,7 +431,7 @@ def run_command(
 # ---------------------------------------------------------------------------
 # read_file
 # ---------------------------------------------------------------------------
-@mcp.tool
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 def read_file(
     path: str,
     start_line: int | None = None,
@@ -474,7 +484,15 @@ def read_file(
 # ---------------------------------------------------------------------------
 # write_file
 # ---------------------------------------------------------------------------
-@mcp.tool
+@mcp.tool(
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        # Writing the same content twice leaves the same file.
+        idempotent_hint=True,
+        destructive_hint=True,
+        open_world_hint=False,
+    )
+)
 def write_file(
     path: str,
     content: str,
@@ -508,7 +526,15 @@ def write_file(
 # ---------------------------------------------------------------------------
 # edit_file
 # ---------------------------------------------------------------------------
-@mcp.tool
+@mcp.tool(
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        # Not idempotent: the second call finds no match and fails.
+        idempotent_hint=False,
+        destructive_hint=True,
+        open_world_hint=False,
+    )
+)
 def edit_file(
     path: str,
     old_str: str,
@@ -556,7 +582,7 @@ def edit_file(
 # ---------------------------------------------------------------------------
 # read_directory
 # ---------------------------------------------------------------------------
-@mcp.tool
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 def read_directory(
     path: str,
     recursive: bool = False,
@@ -609,7 +635,7 @@ def read_directory(
 # ---------------------------------------------------------------------------
 # list_processes
 # ---------------------------------------------------------------------------
-@mcp.tool
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 def list_processes(
     sort_by: str = "cpu",
     limit: int = 30,

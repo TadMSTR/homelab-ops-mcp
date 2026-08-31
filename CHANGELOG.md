@@ -50,6 +50,18 @@
   sharing it. The PM2 IPC variables stay excluded in both modes and cannot be re-added
   through the allowlist.
 
+- **Tool annotations on all six tools.** `list_tools` now returns `readOnlyHint`,
+  `destructiveHint`, `idempotentHint` and `openWorldHint`, so a client can distinguish a
+  read from a write without matching on tool names. `read_file`, `read_directory` and
+  `list_processes` are read-only; `write_file`, `edit_file` and `run_command` are
+  destructive. `write_file` is idempotent and `edit_file` is not — a second identical edit
+  finds no match and fails.
+
+  `run_command` is the only tool with `openWorldHint: true`: it executes arbitrary shell,
+  so the network is inside its envelope. The read-only tools omit `destructiveHint` and
+  `idempotentHint` entirely, which the spec treats as meaningless when `readOnlyHint` is
+  true.
+
 - **Per-stream output cap on `run_command`.** stdout and stderr are each captured up to
   `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB). Output is now read incrementally
   instead of buffered to EOF, so a command producing far more than that is stopped rather

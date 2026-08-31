@@ -17,6 +17,24 @@ This server provides **unrestricted shell access** to the host machine. Any MCP 
 | `read_directory` | List directory contents, optional recursive with `max_depth` |
 | `list_processes` | List running processes sorted by cpu/mem/pid, optional name filter |
 
+## Tool annotations
+
+Every tool publishes MCP annotations, so a client can tell a read from a write without
+maintaining a list of tool names:
+
+| Tool | readOnlyHint | idempotentHint | destructiveHint | openWorldHint |
+|---|---|---|---|---|
+| `read_file` | true | – | – | false |
+| `read_directory` | true | – | – | false |
+| `list_processes` | true | – | – | false |
+| `write_file` | false | true | true | false |
+| `edit_file` | false | false | true | false |
+| `run_command` | false | false | true | **true** |
+
+`run_command` is the only `openWorldHint: true` tool — it runs arbitrary shell, so the
+network is reachable through it. The read-only tools omit the two write hints, which the
+spec treats as meaningless when `readOnlyHint` is true.
+
 ## Transport
 
 Streamable-HTTP on `http://<host>:<port>/mcp` (default `127.0.0.1:8282`).
