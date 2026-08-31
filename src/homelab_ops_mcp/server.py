@@ -48,6 +48,34 @@ def _clean_env() -> dict:
     return {k: v for k, v in os.environ.items() if k not in _PM2_IPC_ENV_VARS}
 
 
+# ---------------------------------------------------------------------------
+# Path validation
+# ---------------------------------------------------------------------------
+class PathValidationError(ValueError):
+    """Raised when a tool is handed a path it must refuse to act on."""
+
+
+def _resolve_path(path: str) -> Path:
+    """Validate ``path`` as absolute and return it as a ``Path``.
+
+    Every file tool's docstring already promises an absolute path, but nothing
+    enforced it. ``Path("~/x")`` is *not* absolute — Python does no tilde
+    expansion — so it resolved against the process cwd, silently creating a
+    literal ``~`` directory under the server's working directory and returning
+    success. Rejecting enforces the documented contract; expanding would quietly
+    change it. The message names the offending path so a calling agent can
+    self-correct in one turn.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        raise PathValidationError(f"path must be absolute, got {path!r}")
+    # Backstop, independent of the check above: never act on a path whose own
+    # components include a literal ``~``. An absolute path can still carry one.
+    if "~" in p.parts:
+        raise PathValidationError(f"path component '~' is not allowed, got {path!r}")
+    return p
+
+
 def _atomic_write(path: Path, content: str) -> int:
     """Write ``content`` to ``path`` atomically and return the byte count.
 
@@ -88,6 +116,13 @@ def run_command(
         timeout: Max seconds to wait before killing the process (default 30).
     """
     working_dir = cwd or str(Path.home())
+    # Only the working directory is validated. Tilde paths *inside* ``command``
+    # are fine — those go through bash, which expands them correctly.
+    try:
+        _resolve_path(working_dir)
+    except PathValidationError as e:
+        log.warning("run_command.invalid_cwd", cwd=working_dir)
+        return {"stdout": "", "stderr": f"cwd: {e}", "exit_code": -1}
     # Command text is sensitive; log it at DEBUG only.
     log.debug("run_command.start", cwd=working_dir, timeout=timeout, command=command)
     try:
@@ -134,7 +169,7 @@ def read_file(
         end_line: Last line to return (1-indexed, inclusive). Omit for end of file.
     """
     try:
-        p = Path(path)
+        p = _resolve_path(path)
         if not p.exists():
             return {"error": f"File not found: {path}"}
         if not p.is_file():
@@ -159,6 +194,9 @@ def read_file(
 
         log.info("read_file.done", path=path, total_lines=total, ranged=False)
         return {"path": path, "total_lines": total, "content": "".join(lines)}
+    except PathValidationError as e:
+        log.warning("read_file.invalid_path", path=path)
+        return {"error": str(e)}
     except PermissionError:
         log.warning("read_file.permission_denied", path=path)
         return {"error": f"Permission denied: {path}"}
@@ -184,12 +222,15 @@ def write_file(
         create_dirs: If True, create parent directories if they don't exist (default True).
     """
     try:
-        p = Path(path)
+        p = _resolve_path(path)
         if create_dirs:
             p.parent.mkdir(parents=True, exist_ok=True)
         written = _atomic_write(p, content)
         log.info("write_file.done", path=path, bytes_written=written)
         return {"path": path, "bytes_written": written}
+    except PathValidationError as e:
+        log.warning("write_file.invalid_path", path=path)
+        return {"error": str(e)}
     except PermissionError:
         log.warning("write_file.permission_denied", path=path)
         return {"error": f"Permission denied: {path}"}
@@ -217,7 +258,7 @@ def edit_file(
         new_str: Replacement string.
     """
     try:
-        p = Path(path)
+        p = _resolve_path(path)
         if not p.exists():
             return {"error": f"File not found: {path}"}
 
@@ -235,6 +276,9 @@ def edit_file(
         _atomic_write(p, updated)
         log.info("edit_file.done", path=path, matches_replaced=1)
         return {"path": path, "status": "ok", "matches_replaced": 1}
+    except PathValidationError as e:
+        log.warning("edit_file.invalid_path", path=path)
+        return {"error": str(e)}
     except PermissionError:
         log.warning("edit_file.permission_denied", path=path)
         return {"error": f"Permission denied: {path}"}
@@ -260,7 +304,7 @@ def read_directory(
         max_depth: Maximum recursion depth when recursive=True (default 2).
     """
     try:
-        p = Path(path)
+        p = _resolve_path(path)
         if not p.exists():
             return {"error": f"Path not found: {path}"}
         if not p.is_dir():
@@ -288,6 +332,9 @@ def read_directory(
         entries = _list(p, 1)
         log.info("read_directory.done", path=path, count=len(entries), recursive=recursive)
         return {"path": path, "entries": entries, "count": len(entries)}
+    except PathValidationError as e:
+        log.warning("read_directory.invalid_path", path=path)
+        return {"error": str(e)}
     except Exception as e:
         log.error("read_directory.error", path=path, error=str(e))
         return {"error": str(e)}

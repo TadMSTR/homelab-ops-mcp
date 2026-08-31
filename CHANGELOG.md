@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **File tools silently mis-wrote tilde paths.** `read_file`, `write_file`,
+  `edit_file` and `read_directory` passed their `path` argument straight to
+  `Path()`, which does no tilde expansion. A path like `~/notes/x.md` is therefore
+  not absolute, so it resolved against the server's working directory: the tool
+  created a literal `~` directory tree there and returned success. All four tools
+  now validate that `path` is absolute and reject it otherwise, with the offending
+  path echoed in the error. A separate backstop refuses any path whose components
+  include a literal `~`, even when the path as a whole is absolute.
+
+  Rejecting rather than expanding is deliberate — every one of these tools already
+  documented its argument as "Absolute path to the file", so this enforces the
+  stated contract instead of quietly widening it.
+
+  `run_command`'s `cwd` argument gets the same validation, and now fails before
+  spawning a shell rather than surfacing a bare `ENOENT`. Tilde paths *inside* the
+  command string are untouched; those go through bash, which expands them correctly.
+
+### Added
+
+- Release workflow (`.github/workflows/release.yml`): a tag push cuts a GitHub
+  Release. (Was added in `72232a6` and not recorded here at the time.)
+
+### Changed
+
+- `ecosystem.config.js` now declares its `env` block explicitly rather than omitting
+  it, so "no environment" reads as an assertion instead of an accident. (Was changed
+  in `acc8c35` and not recorded here at the time.)
+
 ## [0.2.1] — 2026-07-20
 
 ### Security
