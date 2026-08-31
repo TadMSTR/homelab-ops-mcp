@@ -39,6 +39,21 @@ module.exports = {
       // the app *requires*.
       env: {
         SYSTEM_OPS_CHILD_ENV_ENFORCE: "false",
+        // Set explicitly rather than relying on PM2 capturing stderr. With it
+        // set, the server writes its own JSON stream to this file and stderr
+        // carries nothing, so there is one writer and one format.
+        //
+        // Deliberately the same path as out_file/error_file below: the file is
+        // already covered by /etc/logrotate.d/forge-logs
+        // (/home/ted/logs/[!b]*.log, daily, rotate 14, copytruncate), and a
+        // second path would need a second logrotate claim. The handle is opened
+        // in append mode, which is what makes copytruncate safe — writes resume
+        // at the new end of file rather than leaving a sparse gap.
+        //
+        // Do NOT add pm2-logrotate. It is not installed, and a second mechanism
+        // would double-claim these files, which logrotate treats as a hard
+        // error that fails the whole daily run.
+        LOG_FILE: "/home/ted/logs/system-ops.log",
       },
 
       restart_delay: 5000,

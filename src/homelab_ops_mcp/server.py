@@ -20,7 +20,7 @@ import psutil
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from .logging import configure_logging
+from .logging import configure_logging, tame_library_logging
 
 log = configure_logging()
 
@@ -700,12 +700,25 @@ def main() -> None:
     parser.add_argument("--path", default="/mcp", help="HTTP path (default: /mcp)")
     args = parser.parse_args()
 
+    tame_library_logging()
     log.info("server.start", host=args.host, port=args.port, path=args.path)
     mcp.run(  # pragma: no cover
         transport="streamable-http",
+        # 18 lines of ASCII-art banner per start, on a headless service whose
+        # log is read with grep.
+        show_banner=False,
         host=args.host,
         port=args.port,
         path=args.path,
+        uvicorn_config={
+            # Drop the per-request access line — see tame_library_logging().
+            "access_log": False,
+            # log_config=None stops uvicorn running dictConfig, which would
+            # install its own handlers with propagate=False and put its records
+            # beyond reach of the JSON formatter on the root logger. With it
+            # unset, uvicorn's records propagate and come out as JSON.
+            "log_config": None,
+        },
     )
 
 

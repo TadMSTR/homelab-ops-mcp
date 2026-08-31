@@ -75,6 +75,21 @@
 
 ### Changed
 
+- **The log stream is now JSON end to end.** Records from uvicorn, fastmcp and the MCP SDK
+  go through the same structlog processor chain as this server's own events instead of
+  being written as plain text beside them, and every record carries a `logger` field
+  naming its source. fastmcp sets `propagate = False` on its logger and attaches Rich
+  handlers, which also meant its exception tracebacks — the records that matter most when
+  something is wrong — never reached the JSON stream at all; that logger is now reclaimed.
+
+- **uvicorn's per-request access log is off.** One line per request, on a server whose
+  request volume is entirely MCP tool traffic, saying nothing the per-tool events do not
+  already record. Measured on one rotated day-file: 154,109 access lines against 15,089
+  structured events, so 91% of the file was untyped noise. uvicorn *errors* still log.
+
+- The FastMCP startup banner is suppressed — 18 lines of ASCII art per start, on a
+  headless service whose log is read with `grep`.
+
 - `run_command` now kills the child by process group rather than killing `bash` alone.
   A timeout previously reaped the shell but left the commands it had spawned running.
 

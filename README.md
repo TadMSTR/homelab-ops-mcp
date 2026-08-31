@@ -161,6 +161,18 @@ names, but only ones the caller wrote into the command text.
 Command text and file contents are logged at `DEBUG` only; `INFO` records carry
 non-sensitive metadata (paths, cwd, exit codes).
 
+Everything on the stream is JSON, including records from uvicorn, fastmcp and the MCP SDK
+— they are routed through the same processor chain rather than writing plain text
+alongside it. Each record carries a `logger` field naming its source, so this server's own
+events and a library's are distinguishable.
+
+uvicorn's per-request access log is off. It was one line per request with the request
+volume being entirely MCP tool traffic, and it said nothing the per-tool events do not.
+uvicorn *errors* still log.
+
+There is no rotation built in — point `LOG_FILE` at a path your log rotation already
+covers. The handle is opened in append mode, so a `copytruncate`-style rotation is safe.
+
 ## Development
 
 ```bash
