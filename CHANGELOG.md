@@ -1,6 +1,19 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] — 2026-08-31
+
+Two behaviour changes worth reading before upgrading:
+
+1. **Paths must be absolute.** `read_file`, `read_multiple_files`, `write_file`,
+   `edit_file`, `read_directory` and `run_command`'s `cwd` now reject anything else. A
+   caller passing `~/notes/x.md` previously got a success response and a file written
+   somewhere else entirely.
+2. **`run_command` output is capped** at 1 MiB per stream by default, and responses carry a
+   new `truncated` field.
+
+The child-environment allowlist is *not* a behaviour change on upgrade — it ships off, in
+shadow mode. See below.
+
 
 ### Fixed
 
