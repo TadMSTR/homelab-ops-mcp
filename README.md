@@ -211,16 +211,44 @@ what it was:
 | `git_read` | a read-only `git` subcommand |
 | `gh_read` | a read-only `gh` subcommand, including a plain `gh api` GET |
 | `vcs_other` | a `git`/`gh` invocation whose subcommand is not classified |
+| `unclassified` | the command was too long to parse (see below) — *not* a claim that it was harmless |
 | `other` | not `git` or `gh` at all |
 
 It is derived from the parsed command at the same point the `DEBUG` record already has
-it, and sees through `sudo`, absolute paths, leading `VAR=value` assignments, pipelines,
-`&&`/`;` chains and `$(...)` substitution — a compound command takes the class of its most
-significant segment, so `git status && git push` is `git_write`. Where a subcommand is
-ambiguous the classification resolves toward `write`: under-reporting a write would hide
-exactly what the field exists to show. `vcs_other` is deliberately distinct from `other` —
-a `git` subcommand nobody has classified is a very different fact from `ls`, and a rising
-`vcs_other` is the signal the table needs a new entry.
+it. A compound command takes the class of its most significant segment, so
+`git status && git push` is `git_write`.
+
+It sees through the ways one command hides inside another:
+
+| Form | Example |
+|---|---|
+| wrappers and `sudo` | `sudo git reset --hard` |
+| absolute paths | `/usr/bin/git push` |
+| leading assignments | `GIT_DIR=/a git -C /b push` |
+| pipelines and `&&`/`;` chains | `git status && git push` |
+| newlines | `cd /r`⏎`git push` |
+| command substitution | `echo $(git push)`, `` x=`git push` `` |
+| shell `-c` payloads | `bash -c "git push"` |
+| positional wrapper args | `timeout 30 git push`, `ssh host git push` |
+| command-bearing flags | `find . -exec git push {} \;` |
+| nested git execution | `git submodule foreach 'git push'` |
+
+Where a subcommand is ambiguous the classification resolves toward `write`:
+under-reporting a write would hide exactly what the field exists to show. That includes
+subcommands whose bare form reads harmless but is not — `git stash` *is* `git stash push`,
+`git reflog expire` destroys history, `git bisect start` moves `HEAD`.
+
+`vcs_other` is deliberately distinct from `other` — a `git` subcommand nobody has
+classified is a very different fact from `ls`, and a rising `vcs_other` is the signal the
+table needs a new entry.
+
+`unclassified` is distinct from both. Commands longer than `MAX_CLASSIFY_BYTES` (64 KiB)
+are parsed only up to that bound, because `shlex` is quadratic on one long unbroken token
+and classification runs *before* `run_command`'s own `timeout` can apply — so an oversized
+command would otherwise hang the call at the classification step regardless of `timeout`.
+If a write is found in the parsed head it is still reported; if nothing is found the answer
+is `unclassified`, never `other`. `other` is a positive claim that this was not a repo
+operation, and a parse that was declined cannot support it.
 
 Everything on the stream is JSON, including records from uvicorn, fastmcp and the MCP SDK
 — they are routed through the same processor chain rather than writing plain text

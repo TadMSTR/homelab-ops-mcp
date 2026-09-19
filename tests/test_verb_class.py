@@ -218,3 +218,107 @@ def test_the_marker_would_have_been_visible_at_debug(monkeypatch, tmp_path):
         monkeypatch.delenv("LOG_FILE", raising=False)
         monkeypatch.delenv("LOG_LEVEL", raising=False)
         hlog.configure_logging()
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 — commands carried inside another command's arguments
+#
+# All of these classified as `other` or `git_read` on the first pass. They share one
+# root cause: the classifier only looked at the head of each segment, so anything
+# nested in a quoted payload, behind a positional wrapper argument, or on a second
+# line escaped it entirely. That matters more than a missed log line — the programme's
+# later part plans to *block* on this signal, and `bash -c` is three characters.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # `run_command` itself executes via `bash -c`, so this is the most ordinary
+        # wrapper on the system, not an exotic evasion.
+        ('bash -c "git push"', GIT_WRITE),
+        ("sh -c 'git push origin main'", GIT_WRITE),
+        ('bash -lc "git commit -m x"', GIT_WRITE),
+        ('bash -c "ls -la"', OTHER),
+        ('bash -c "git status"', GIT_READ),
+        # newline-separated commands: `\n` was in _SEPARATORS but shlex's
+        # whitespace_split ate it, so the clause could never fire
+        ("git status\ngit push", GIT_WRITE),
+        ("cd /r\ngit push", GIT_WRITE),
+        ("git status\ngit log", GIT_READ),
+        ("git status\r\ngit push", GIT_WRITE),
+        # positional wrapper arguments
+        ("timeout 30 git push", GIT_WRITE),
+        ("timeout 30 ls", OTHER),
+        ("flock /tmp/lock git push", GIT_WRITE),
+        ("ssh host git push", GIT_WRITE),
+        # a command behind a command-bearing flag
+        ("find . -exec git push {} ;", GIT_WRITE),
+        ("find . -name '*.py'", OTHER),
+    ],
+)
+def test_a_command_nested_in_another_command_is_still_found(command, expected):
+    assert classify_verb(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # `git submodule foreach` runs an arbitrary shell command in every submodule —
+        # a write wearing a read's name (CodeRabbit, PR #7)
+        ('git submodule foreach "git push"', GIT_WRITE),
+        ("git submodule status", GIT_READ),
+        ("git submodule update --init", GIT_WRITE),
+        # bare `git stash` IS `git stash push` and changes local state
+        ("git stash", GIT_WRITE),
+        ("git stash list", GIT_READ),
+        ("git stash show", GIT_READ),
+        ("git stash pop", GIT_WRITE),
+        # reflog/bisect were flat reads; several of their actions destroy state
+        ("git reflog", GIT_READ),
+        ("git reflog show", GIT_READ),
+        ("git reflog expire --expire=now --all", GIT_WRITE),
+        ("git reflog delete HEAD@{0}", GIT_WRITE),
+        ("git bisect log", GIT_READ),
+        ("git bisect start", GIT_WRITE),
+        ("git bisect reset", GIT_WRITE),
+        # bare `git remote` still lists — the bare-is-write rule must not over-apply
+        ("git remote", GIT_READ),
+        ("git notes", GIT_READ),
+    ],
+)
+def test_subcommands_that_write_despite_a_read_shaped_name(command, expected):
+    assert classify_verb(command) == expected
+
+
+def test_oversized_command_is_unclassified_not_other(monkeypatch):
+    """`other` is a positive claim that this was not a repo operation. A parse that was
+    declined cannot support it, and anything gating on this must be able to tell
+    "we looked and it was fine" from "we did not look"."""
+    from homelab_ops_mcp.verbclass import MAX_CLASSIFY_BYTES, UNCLASSIFIED
+
+    assert classify_verb("echo " + "a" * (MAX_CLASSIFY_BYTES + 10)) == UNCLASSIFIED
+    # a write in the parsed head is still a positive finding
+    assert classify_verb("git push " + "a" * (MAX_CLASSIFY_BYTES + 10)) == GIT_WRITE
+    # and a normal-length non-git command is still a confident `other`
+    assert classify_verb("echo hello") == OTHER
+
+
+def test_classification_is_bounded_in_time():
+    """The tokenizer is quadratic on one long unbroken token, and classification runs
+    before run_command's own timeout can apply — so an oversized command would hang the
+    call at the classification step regardless of `timeout`. Measured pre-fix:
+    2M chars took 30.5s."""
+    import time
+
+    from homelab_ops_mcp.verbclass import MAX_CLASSIFY_BYTES
+
+    start = time.perf_counter()
+    classify_verb("echo " + "a" * (MAX_CLASSIFY_BYTES * 40))
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"classification took {elapsed:.1f}s — the cap is not holding"
+
+
+def test_recursion_is_depth_bounded():
+    nested = 'bash -c "' * 12 + "git push" + '"' * 12
+    assert classify_verb(nested) in VERB_CLASSES  # terminates, whatever it decides

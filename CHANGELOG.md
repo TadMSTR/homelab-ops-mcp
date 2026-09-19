@@ -21,6 +21,30 @@
   a write, and where the two cannot be told apart confidently the answer is `write`,
   because under-reporting hides the thing being looked for.
 
+  Commands over `MAX_CLASSIFY_BYTES` (64 KiB) report `unclassified` rather than `other`.
+  `shlex` is quadratic on one long unbroken token (2M chars measured at 30.5s) and
+  classification runs before `run_command`'s own `timeout` applies, so an oversized
+  command would hang the call at the classification step irrespective of `timeout`. The
+  head is still parsed, so a write there is still reported; but `other` is a positive
+  claim that this was not a repo operation, and a declined parse cannot support it.
+
+  **Review round 2** closed a set of gaps that shared one root cause — a command carried
+  inside another command's arguments escaped classification entirely:
+
+  - `bash -c "git push"` / `sh -c ...` read as `other`. `run_command` itself executes via
+    `bash -c`, so this is the most ordinary wrapper on the system, not an exotic evasion.
+  - Newline-separated commands took the class of the first line only, so
+    `git status`⏎`git push` read as `git_read`. `"\n"` was in the separator set but
+    `shlex`'s `whitespace_split` consumed it, so that clause could never fire.
+  - `timeout 30 git push` read as `other` — prefix-stripping stopped at the positional
+    `30`. Same for `flock <file>`, `ssh <host>`, `su <user>`.
+  - `find . -exec git push {} \;` read as `other`.
+  - `git submodule foreach 'git push'` read as `git_read` — `foreach` runs an arbitrary
+    shell command in every submodule.
+  - bare `git stash` read as `git_read`; it is `git stash push` and changes local state.
+  - `git reflog expire`/`delete` and `git bisect start`/`reset` read as `git_read`;
+    they destroy history and move `HEAD` respectively.
+
 ## [0.3.0] — 2026-08-31
 
 Two behaviour changes worth reading before upgrading:
