@@ -193,13 +193,34 @@ Structured JSON logs go to stderr by default. Tune via environment variables:
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 | `LOG_FILE` | _(unset)_ | Append logs to this path instead of stderr |
 
-`run_command.done`, `.timeout` and `.error` records carry `env_withheld_count` and
-`env_enforced`. For the environment itself only the count is recorded — never a variable
-name, never a value. The separate `run_command.env_referenced_withheld` record does carry
-names, but only ones the caller wrote into the command text.
+`run_command.done`, `.timeout` and `.error` records carry `env_withheld_count`,
+`env_enforced` and `verb_class`. For the environment itself only the count is recorded —
+never a variable name, never a value. The separate `run_command.env_referenced_withheld`
+record does carry names, but only ones the caller wrote into the command text.
 
 Command text and file contents are logged at `DEBUG` only; `INFO` records carry
 non-sensitive metadata (paths, cwd, exit codes).
+
+`verb_class` says whether the command was a version-control operation, without saying
+what it was:
+
+| Value | Meaning |
+|-------|---------|
+| `git_write` | a `git` subcommand that changes local or remote state |
+| `gh_write` | a `gh` subcommand that changes state, including `gh api` with a non-GET method |
+| `git_read` | a read-only `git` subcommand |
+| `gh_read` | a read-only `gh` subcommand, including a plain `gh api` GET |
+| `vcs_other` | a `git`/`gh` invocation whose subcommand is not classified |
+| `other` | not `git` or `gh` at all |
+
+It is derived from the parsed command at the same point the `DEBUG` record already has
+it, and sees through `sudo`, absolute paths, leading `VAR=value` assignments, pipelines,
+`&&`/`;` chains and `$(...)` substitution — a compound command takes the class of its most
+significant segment, so `git status && git push` is `git_write`. Where a subcommand is
+ambiguous the classification resolves toward `write`: under-reporting a write would hide
+exactly what the field exists to show. `vcs_other` is deliberately distinct from `other` —
+a `git` subcommand nobody has classified is a very different fact from `ls`, and a rising
+`vcs_other` is the signal the table needs a new entry.
 
 Everything on the stream is JSON, including records from uvicorn, fastmcp and the MCP SDK
 — they are routed through the same processor chain rather than writing plain text

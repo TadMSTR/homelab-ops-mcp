@@ -39,6 +39,7 @@ from fastmcp import FastMCP
 
 from . import telemetry
 from .logging import configure_logging, tame_library_logging
+from .verbclass import classify_verb
 
 log = configure_logging()
 
@@ -438,6 +439,10 @@ def run_command(
         )
     # Command text is sensitive; log it at DEBUG only.
     log.debug("run_command.start", cwd=working_dir, timeout=timeout, command=command)
+    # The text stays at DEBUG; only its class travels. This is what makes an agent
+    # working around githost-mcp visible without publishing what it typed — a class
+    # is bounded cardinality and cannot carry a token pasted onto a command line.
+    verb_class = classify_verb(command)
     limit = _output_limit()
     started = time.perf_counter()
     try:
@@ -450,6 +455,7 @@ def run_command(
                 "run_command.timeout",
                 cwd=working_dir,
                 timeout=timeout,
+                verb_class=verb_class,
                 env_withheld_count=withheld,
                 env_enforced=enforced,
             )
@@ -476,6 +482,7 @@ def run_command(
             "run_command.done",
             cwd=working_dir,
             exit_code=exit_code,
+            verb_class=verb_class,
             env_withheld_count=withheld,
             env_enforced=enforced,
         )
@@ -491,6 +498,7 @@ def run_command(
             "run_command.error",
             cwd=working_dir,
             error=str(e),
+            verb_class=verb_class,
             env_withheld_count=withheld,
             env_enforced=enforced,
         )

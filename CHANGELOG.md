@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`verb_class` on every `run_command` outcome record.** `run_command.done`,
+  `.timeout` and `.error` now carry one of `git_write`, `gh_write`, `git_read`,
+  `gh_read`, `vcs_other` or `other`.
+
+  The command text itself stays at `DEBUG`, unchanged and deliberately — it can carry
+  a token someone pasted onto a command line. What was missing is any `INFO`-level
+  signal that a call *was* a repo write, which is what makes an agent shelling out
+  around githost-mcp visible at all. A class is bounded cardinality, is safe on a log
+  line and a metric label, and answers the only question the detector asks.
+
+  The classifier sees through `sudo`, absolute paths, leading `VAR=value` assignments,
+  pipelines, `&&`/`;` chains and `$(...)`/backtick substitution; a compound command
+  takes the class of its most significant segment. Ambiguous subcommands resolve
+  toward `write` — `git branch` lists and is a read, `git branch -d x` deletes and is
+  a write, and where the two cannot be told apart confidently the answer is `write`,
+  because under-reporting hides the thing being looked for.
+
 ## [0.3.0] — 2026-08-31
 
 Two behaviour changes worth reading before upgrading:
