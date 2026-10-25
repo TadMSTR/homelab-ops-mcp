@@ -93,7 +93,12 @@ jobs:
         run: |
           uv lock --upgrade
           uv sync --frozen --extra dev --extra telemetry
-          uv pip list | grep -iE '^(fastmcp|mcp|starlette|uvicorn) '
+      # Read from the project venv: a bare `uv pip list` follows UV_PYTHON to the
+      # setup-python interpreter, which has none of these installed.
+      - name: Versions under test
+        run: >-
+          uv run --frozen --no-sync python -c "import importlib.metadata as m;
+          [print(p, m.version(p)) for p in ('fastmcp', 'mcp', 'starlette', 'uvicorn')]"
       - run: uv run --frozen --no-sync pytest
 
   # DEPENDENCY AUDIT, against the lock. `pip-audit .` re-resolves the declared
