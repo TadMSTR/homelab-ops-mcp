@@ -25,10 +25,12 @@ the command text. Pinned by test.
 import contextlib
 import difflib
 import functools
+import logging
 import os
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -38,7 +40,7 @@ import psutil
 from fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from starlette.middleware import Middleware
-from starlette.requests import Request
+from starlette.requests import HTTPConnection
 
 from . import telemetry
 from .logging import configure_logging, tame_library_logging
@@ -245,6 +247,53 @@ class LinkedFileError(OSError):
     """Raised when the target has other hard links that a rename would detach."""
 
 
+class UnsafeLinkError(PermissionError):
+    """Raised for a symlink the kernel's ``protected_symlinks`` rule would not follow."""
+
+
+_MAX_LINK_HOPS = 40  # the kernel's own limit (ELOOP)
+
+
+def _link_hop_allowed(link_uid: int, dir_mode: int, dir_uid: int, euid: int) -> bool:
+    """The ``fs.protected_symlinks`` rule, for one link.
+
+    In a sticky, world-writable directory (``/tmp``), a link is followed only if
+    the follower owns it or the link's owner owns the directory. Anyone can
+    plant a link in such a directory, so without this rule a write to
+    ``/tmp/report.txt`` could be steered into any file the server can write.
+    """
+    shared = dir_mode & stat.S_ISVTX and dir_mode & stat.S_IWOTH
+    return not shared or link_uid in (euid, dir_uid)
+
+
+def _check_link_chain(path: Path) -> None:
+    """Refuse the write if any hop of the final component's link chain is unsafe.
+
+    ``os.path.realpath`` resolves links itself with ``lstat``/``readlink``, so
+    the kernel never follows them and its ``protected_symlinks`` check never
+    runs, and the host may have it switched off anyway. So the rule is applied
+    here, to every hop. Directory components are not re-checked: one owned by
+    someone else can still be swapped between the check and the rename, which
+    is the general limit of path-based writes.
+    """
+    current = path
+    for _ in range(_MAX_LINK_HOPS):
+        try:
+            link = os.lstat(current)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISLNK(link.st_mode):
+            return
+        parent = os.stat(current.parent)
+        if not _link_hop_allowed(link.st_uid, parent.st_mode, parent.st_uid, os.geteuid()):
+            raise UnsafeLinkError(
+                f"{current} is a symlink in a shared sticky directory, owned by neither "
+                "you nor the directory's owner; it was not followed and nothing was written."
+            )
+        current = current.parent / os.readlink(current)
+    raise OSError(f"too many levels of symbolic links: {path}")
+
+
 def _write_target(path: Path) -> Path:
     """The file a write to ``path`` must land on: through any symlink, never past a hard link.
 
@@ -253,13 +302,18 @@ def _write_target(path: Path) -> Path:
     target untouched — while the tool reports success. The contract is
     therefore *write through*: a symlink (or a chain of them, dangling or not)
     is resolved and the rename happens next to the real file, so the link
-    survives and its target changes, exactly as ``echo > link`` would.
+    survives and its target changes, as ``echo > link`` would.
 
     A hard link has no "through": every name is the file. Renaming over one
     name silently detaches it from the others, so that case is refused rather
     than half-done. A non-atomic in-place write would keep the link, at the
     cost of the crash safety the rename exists for.
+
+    A link that the kernel's ``protected_symlinks`` rule would refuse to follow
+    (one planted in ``/tmp`` by another user) is refused here too: see
+    ``_check_link_chain``.
     """
+    _check_link_chain(path)
     target = Path(os.path.realpath(path))
     with contextlib.suppress(FileNotFoundError):
         st = os.stat(target)
@@ -793,9 +847,11 @@ _CLOSEST_MATCH_MAX_BYTES = 2 * 1024 * 1024
 # quadratic in len(old_str) and pure Python, so it holds the GIL and slows every
 # other agent's call while it runs. Measured before these bounds: 11 s for a
 # 1 KiB old_str against a 35 KiB file, 168 s for 2 KiB against 80 KiB. The
-# length cap bounds one comparison, the wall-clock budget bounds the scan, and
-# a scan that runs out of budget offers no hint rather than a partial one.
-_CLOSEST_MATCH_MAX_OLD = 4096
+# budget is checked between windows, so the length cap is what bounds a single
+# comparison (one ratio() at 4 KiB against a 12 KiB window measured ~3 s, so
+# the cap is 2 KiB). A scan that runs out of budget offers no hint rather than
+# a partial one.
+_CLOSEST_MATCH_MAX_OLD = 2048
 _CLOSEST_MATCH_BUDGET_S = 1.0
 # Below this similarity the "closest" window is noise and quoting it misleads.
 _CLOSEST_MATCH_MIN_RATIO = 0.5
@@ -914,6 +970,7 @@ def edit_file(
             # never touched.
             original = raw.decode("utf-8")
         except UnicodeDecodeError as e:
+            log.info("edit_file.not_utf8", path=path)
             return {
                 "error": f"File is not valid UTF-8 (byte {e.start}); edit_file would have "
                 "to re-encode it, so no changes were made. Use run_command for this file."
@@ -922,8 +979,9 @@ def edit_file(
         crlf = False
         if count == 0 and "\r\n" in original and "\n" in old_str and "\r" not in old_str:
             crlf_old = old_str.replace("\n", "\r\n")
-            if original.count(crlf_old) == 1:
-                old_str, count, crlf = crlf_old, 1, True
+            crlf_count = original.count(crlf_old)
+            if crlf_count:
+                old_str, count, crlf = crlf_old, crlf_count, True
                 if "\r" not in new_str:
                     new_str = new_str.replace("\n", "\r\n")
 
@@ -1130,14 +1188,26 @@ class HostOriginGuard:
     def __init__(self, app, settings: TransportSecuritySettings):
         self.app = app
         self.check = TransportSecurityMiddleware(settings)
+        # mcp's check logs each refusal as f"Invalid Host header: {host}", the
+        # raw caller-supplied value. The refusal is logged above without it.
+        logging.getLogger("mcp.server.transport_security").setLevel(logging.ERROR)
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        # WebSocket too: no route takes one today, and a later one must not
+        # arrive unguarded.
+        if scope["type"] in ("http", "websocket"):
             # is_post=False: Content-Type is checked by the MCP transport itself.
-            refusal = await self.check.validate_request(Request(scope), is_post=False)
+            # Only the headers are read, so an HTTPConnection serves both types.
+            refusal = await self.check.validate_request(HTTPConnection(scope), is_post=False)
             if refusal is not None:
-                log.warning("http.request_refused", status=refusal.status_code)
-                await refusal(scope, receive, send)
+                log.warning(
+                    "http.request_refused", status=refusal.status_code, scope_type=scope["type"]
+                )
+                if scope["type"] == "websocket":
+                    # Closing before accept makes the server answer the upgrade with 403.
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    await refusal(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 

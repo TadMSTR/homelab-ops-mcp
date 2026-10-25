@@ -80,10 +80,14 @@ IP ranges.
 ## Installation
 
 ```bash
-pip install .           # or: pip install -e .   for development
+uv sync --frozen --no-dev --no-editable          # a deployment: exactly the audited uv.lock
+uv sync --frozen --no-dev --no-editable --extra telemetry   # ... with telemetry
+pip install .                                     # ad hoc: re-resolves, so NOT the lock
 ```
 
 This installs the `homelab_ops_mcp` package and a `homelab-ops-mcp` console script.
+CI tests and audits the versions in `uv.lock`; `pip install .` resolves the ranges in
+`pyproject.toml` afresh and can install something CI never saw.
 
 ## Running
 
@@ -175,7 +179,7 @@ timeout is the command's outcome and leaves it `null`.
 | Byte fidelity | `read_file` returns content as it is on disk, CRLF included. `edit_file` rewrites only the matched span; every other byte is kept. In a CRLF file an `old_str` written with LF breaks is matched against its CRLF form and `new_str` is given CRLF breaks (`line_endings: "crlf"` in the result). A file that is not valid UTF-8 is refused by `edit_file` rather than re-encoded. |
 | Symlinks | `write_file` and `edit_file` write *through* a symlink: the link is kept, its target changes, and `written_to` names the file written. |
 | Hard links | A file with more than one hard link is refused by `write_file` and `edit_file`. Their writes are atomic (temp file and rename), and a rename would detach this name from the others. |
-| No-match hint | When `edit_file` finds no match it quotes the closest passage. That search is skipped for an `old_str` over 4 KiB or a file over 2 MiB, and gives up after one second, so a failed edit always returns promptly. |
+| No-match hint | When `edit_file` finds no match it quotes the closest passage. That search is skipped for an `old_str` over 2 KiB or a file over 2 MiB, and gives up after one second, so a failed edit always returns promptly. |
 
 ### Child process environment
 

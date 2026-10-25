@@ -5,6 +5,8 @@ passes, rather than calling the guard in isolation, so a guard that is defined
 but never wired in fails here.
 """
 
+import asyncio
+import logging
 import sys
 
 import pytest
@@ -82,10 +84,67 @@ def test_extra_host_from_env(client, monkeypatch):
     assert _post(client, host="host.docker.internal:9999").status_code == 421
 
 
-def test_refusal_is_logged_without_the_header(client, recorder):
-    _post(client, host="evil.example")
-    events = recorder.of("http.request_refused")
-    assert events == [{"status": 421}]
+def test_refusal_is_logged_without_the_header(client, recorder, caplog):
+    """Neither our event nor any library record may carry the caller's header value.
+
+    mcp's own check logs ``Invalid Host header: <value>``; a test that only
+    replaced ``server.log`` could not see that, so stdlib records are checked too.
+    """
+    with caplog.at_level(logging.DEBUG):
+        _post(client, host="evil.example", origin="http://evil-origin.example")
+        _post(client, host="localhost:8282", origin="http://evil-origin.example")
+    assert recorder.of("http.request_refused") == [
+        {"status": 421, "scope_type": "http"},
+        {"status": 403, "scope_type": "http"},
+    ]
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "evil.example" not in logged
+    assert "evil-origin.example" not in logged
+
+
+def _ws_scope(host):
+    return {
+        "type": "websocket",
+        "path": "/mcp",
+        "headers": [(b"host", host.encode())],
+        "query_string": b"",
+    }
+
+
+async def _drive(guard, scope):
+    sent = []
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(message):
+        sent.append(message)
+
+    await guard(scope, receive, send)
+    return sent
+
+
+def test_websocket_with_a_foreign_host_is_closed_unserved():
+    reached = []
+
+    async def app(scope, receive, send):
+        reached.append(scope["type"])
+
+    guard = server.HostOriginGuard(app, server._transport_security_settings())
+    sent = asyncio.run(_drive(guard, _ws_scope("evil.example")))
+    assert sent == [{"type": "websocket.close", "code": 1008}]
+    assert reached == []
+
+
+def test_websocket_with_a_loopback_host_reaches_the_app():
+    reached = []
+
+    async def app(scope, receive, send):
+        reached.append(scope["type"])
+
+    guard = server.HostOriginGuard(app, server._transport_security_settings())
+    asyncio.run(_drive(guard, _ws_scope("localhost:8282")))
+    assert reached == ["websocket"]
 
 
 def test_main_wires_the_guard(monkeypatch):

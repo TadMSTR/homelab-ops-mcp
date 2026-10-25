@@ -109,6 +109,87 @@ def test_edit_file_dry_run_refuses_a_hard_linked_file(hardlinked):
     assert "hard links" in r["error"]
 
 
+# --- links planted in a shared sticky directory are not followed -------------
+@pytest.mark.parametrize(
+    ("link_uid", "dir_mode", "dir_uid", "allowed"),
+    [
+        (1000, 0o41777, 0, True),  # follower owns the link
+        (2000, 0o41777, 2000, True),  # link owner owns the directory
+        (2000, 0o41777, 0, False),  # /tmp, someone else's link
+        (2000, 0o40777, 0, True),  # world-writable but not sticky
+        (2000, 0o41755, 0, True),  # sticky but not world-writable
+    ],
+)
+def test_protected_symlinks_rule(link_uid, dir_mode, dir_uid, allowed):
+    assert server._link_hop_allowed(link_uid, dir_mode, dir_uid, euid=1000) is allowed
+
+
+@pytest.fixture()
+def sticky(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o1777)
+    yield shared
+    shared.chmod(0o755)
+
+
+def _as_foreign_link(monkeypatch, link):
+    """Make ``link`` look owned by another uid (creating one for real needs root)."""
+    real_lstat = os.lstat
+
+    def lstat(p, *a, **k):
+        st = real_lstat(p, *a, **k)
+        if os.fspath(p) == os.fspath(link):
+            fields = list(st)
+            fields[4] = os.geteuid() + 4242  # st_uid
+            return os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(server.os, "lstat", lstat)
+
+
+def test_foreign_link_in_a_sticky_directory_is_refused(monkeypatch, tmp_path, sticky):
+    victim = tmp_path / "authorized_keys"
+    victim.write_text("original\n")
+    planted = sticky / "report.txt"
+    planted.symlink_to(victim)
+    _as_foreign_link(monkeypatch, planted)
+    for result in (
+        write_file(str(planted), "attacker\n"),
+        edit_file(str(planted), "original", "attacker"),
+    ):
+        assert "Permission denied" in result["error"]
+    assert victim.read_text() == "original\n"
+
+
+def test_foreign_link_later_in_the_chain_is_refused(monkeypatch, tmp_path, sticky):
+    victim = tmp_path / "victim"
+    victim.write_text("original\n")
+    hop2 = sticky / "hop2"
+    hop2.symlink_to(victim)
+    hop1 = tmp_path / "hop1"
+    hop1.symlink_to(hop2)
+    _as_foreign_link(monkeypatch, hop2)
+    assert "error" in write_file(str(hop1), "attacker\n")
+    assert victim.read_text() == "original\n"
+
+
+def test_own_link_in_a_sticky_directory_is_followed(tmp_path, sticky):
+    target = tmp_path / "mine"
+    target.write_text("a\n")
+    lnk = sticky / "lnk"
+    lnk.symlink_to(target)
+    write_file(str(lnk), "b\n")
+    assert target.read_text() == "b\n"
+
+
+def test_link_loop_is_an_error(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    assert "error" in write_file(str(a), "x")
+
+
 # --- edit_file changes only the matched bytes --------------------------------
 def test_crlf_line_endings_survive_an_edit(tmp_path):
     p = tmp_path / "win.ini"
@@ -124,6 +205,14 @@ def test_lf_old_str_matches_in_a_crlf_file_and_new_str_follows(tmp_path):
     r = edit_file(str(p), "[a]\nk=1\n", "[a]\nk=2\nj=3\n")
     assert r["line_endings"] == "crlf"
     assert p.read_bytes() == b"[a]\r\nk=2\r\nj=3\r\n[b]\r\n"
+
+
+def test_lf_old_str_matching_several_crlf_spans_reports_the_count(tmp_path):
+    p = tmp_path / "win.ini"
+    p.write_bytes(b"a\r\nb\r\na\r\nb\r\n")
+    r = edit_file(str(p), "a\nb", "x")
+    assert "matched 2 times" in r["error"]
+    assert p.read_bytes() == b"a\r\nb\r\na\r\nb\r\n"
 
 
 def test_crlf_old_str_matches_directly(tmp_path):

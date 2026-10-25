@@ -35,7 +35,7 @@ Behaviour changes worth reading before upgrading:
 - **Bounded work on the shared process.** `edit_file`'s closest-match hint could run for
   minutes on an ordinary stale `old_str` (168 s measured for 2 KiB against an 80 KiB
   file), holding the GIL and slowing every other client. It is now skipped for an
-  `old_str` over 4 KiB and gives up after one second. `read_file` and
+  `old_str` over 2 KiB and gives up after one second. `read_file` and
   `read_multiple_files` had no size bound; they now stream the file and share the
   `run_command` byte cap.
 

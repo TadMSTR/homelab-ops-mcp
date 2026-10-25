@@ -9,7 +9,7 @@ build/
 venv/
 .env
 *.env
-core.*
+core.[0-9]*
 *.core
 .coverage
 htmlcov/
