@@ -67,7 +67,12 @@ slows or kills it for every client. The bounds:
 ## File writes
 
 `write_file` and `edit_file` write a temp file beside the target and rename it over,
-so a crash leaves the old file or the new one. A symlink is resolved first, so the
+so a crash leaves the old file or the new one. The path is first resolved one
+component at a time (`_checked_resolve`), applying the `protected_symlinks` rule to
+every symlink met, in a directory component or the final one. The real parent
+directory is then opened through the kernel (so the kernel's own rule covers any link
+swapped in since), and the temp file, the rename and `edit_file`'s read all happen
+relative to that directory fd, without following links at the final name. So the
 rename lands next to the real file and the link survives. A hard-linked file is refused,
 because the rename would detach the name from its other links. `edit_file` decodes the
 file as strict UTF-8 with no newline translation, so the bytes it did not edit are

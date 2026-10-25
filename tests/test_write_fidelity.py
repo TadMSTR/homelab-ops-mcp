@@ -158,8 +158,150 @@ def test_foreign_link_in_a_sticky_directory_is_refused(monkeypatch, tmp_path, st
         write_file(str(planted), "attacker\n"),
         edit_file(str(planted), "original", "attacker"),
     ):
-        assert "Permission denied" in result["error"]
+        # The refusal explains itself rather than reading as a plain EACCES (F-05).
+        assert "not followed" in result["error"]
     assert victim.read_text() == "original\n"
+
+
+def test_unsafe_link_refusal_has_its_own_log_event(monkeypatch, tmp_path, sticky, recorder):
+    victim = tmp_path / "v"
+    victim.write_text("original\n")
+    planted = sticky / "report.txt"
+    planted.symlink_to(victim)
+    _as_foreign_link(monkeypatch, planted)
+    write_file(str(planted), "x")
+    edit_file(str(planted), "original", "x")
+    assert recorder.of("write_file.unsafe_link_refused") == [{"path": str(planted)}]
+    assert recorder.of("edit_file.unsafe_link_refused") == [{"path": str(planted)}]
+    assert recorder.of("write_file.permission_denied") == []
+
+
+def test_foreign_directory_link_in_a_sticky_directory_is_refused(monkeypatch, tmp_path, sticky):
+    """F-01: /tmp/<dir> -> ~/.ssh, then a write to /tmp/<dir>/authorized_keys.
+
+    The check used to cover only the final component and its hops, so a link
+    in a directory component went through realpath unchecked.
+    """
+    victim_dir = tmp_path / "dot_ssh"
+    victim_dir.mkdir()
+    victim = victim_dir / "authorized_keys"
+    victim.write_text("original\n")
+    planted = sticky / "somedir"
+    planted.symlink_to(victim_dir)
+    _as_foreign_link(monkeypatch, planted)
+    for result in (
+        write_file(str(planted / "authorized_keys"), "attacker\n"),
+        edit_file(str(planted / "authorized_keys"), "original", "attacker"),
+        write_file(str(planted / "new_file"), "attacker\n"),
+    ):
+        assert "not followed" in result["error"]
+    assert victim.read_text() == "original\n"
+    assert sorted(p.name for p in victim_dir.iterdir()) == ["authorized_keys"]
+
+
+def test_own_directory_link_is_followed(tmp_path, sticky):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (sticky / "dirlink").symlink_to(real_dir)
+    r = write_file(str(sticky / "dirlink" / "f"), "x")
+    assert (real_dir / "f").read_text() == "x"
+    assert r["written_to"] == str(real_dir / "f")
+
+
+def test_link_planted_at_a_missing_name_after_the_check_is_replaced_not_followed(
+    monkeypatch, tmp_path
+):
+    """F-01 second aspect: the final name did not exist when checked, then a link appears.
+
+    The rename replaces the directory entry, so the late link is overwritten
+    rather than written through.
+    """
+    victim = tmp_path / "victim"
+    victim.write_text("original\n")
+    name = tmp_path / "report.txt"
+    real_resolve = server._checked_resolve
+
+    def resolve_then_plant(path):
+        resolved = real_resolve(path)
+        name.symlink_to(victim)
+        return resolved
+
+    monkeypatch.setattr(server, "_checked_resolve", resolve_then_plant)
+    assert write_file(str(name), "new\n")["bytes_written"] == 4
+    assert victim.read_text() == "original\n"
+    assert not name.is_symlink()
+    assert name.read_text() == "new\n"
+
+
+def test_directories_are_opened_by_the_kernel_not_resolved_in_userspace(monkeypatch, link):
+    """realpath follows links in userspace, out of reach of protected_symlinks."""
+
+    def forbidden(*a, **k):
+        raise AssertionError("os.path.realpath must not be used on the write path")
+
+    monkeypatch.setattr(server.os.path, "realpath", forbidden)
+    lnk, real = link
+    write_file(str(lnk), "a = 9\n")
+    edit_file(str(lnk), "9", "8")
+    assert real.read_text() == "a = 8\n"
+
+
+def test_a_kernel_refusal_of_the_directory_stops_the_write(monkeypatch, tmp_path):
+    """What protected_symlinks looks like from here: EACCES opening the directory."""
+    real_open = os.open
+
+    def deny_dirs(p, flags, *a, **k):
+        if flags & os.O_DIRECTORY:
+            raise PermissionError(13, "Permission denied", p)
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(server.os, "open", deny_dirs)
+    target = tmp_path / "f"
+    assert "Permission denied" in write_file(str(target), "x")["error"]
+    assert not target.exists()
+
+
+def test_dangling_link_into_a_missing_directory_creates_it(tmp_path):
+    """CR-02: create_dirs applies to the directory the write lands in."""
+    lnk = tmp_path / "lnk"
+    lnk.symlink_to(tmp_path / "new" / "deeper" / "f.txt")
+    r = write_file(str(lnk), "x")
+    assert (tmp_path / "new" / "deeper" / "f.txt").read_text() == "x"
+    assert lnk.is_symlink()
+    assert "error" not in r
+
+
+def test_writing_to_a_directory_is_refused(tmp_path):
+    (tmp_path / "d").mkdir()
+    assert "is a directory" in write_file(str(tmp_path / "d"), "x")["error"]
+
+
+# --- edit_file reads only bounded regular files (F-04) ------------------------
+def test_edit_file_refuses_a_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    started = time.monotonic()
+    r = edit_file(str(fifo), "a", "b")
+    assert time.monotonic() - started < 2
+    assert "not a regular file" in r["error"]
+
+
+def test_edit_file_refuses_a_device(tmp_path):
+    assert "not a regular file" in edit_file("/dev/null", "a", "b")["error"]
+
+
+def test_edit_file_refuses_a_file_over_the_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_EDIT_MAX_BYTES", 100)
+    p = tmp_path / "big"
+    p.write_text("x" * 101)
+    r = edit_file(str(p), "x", "y")
+    assert "over edit_file's 100-byte limit" in r["error"]
+    assert p.read_text() == "x" * 101
+
+
+def test_edit_file_in_a_missing_directory_is_not_found(tmp_path):
+    r = edit_file(str(tmp_path / "nope" / "f"), "a", "b")
+    assert r["error"].startswith("File not found")
 
 
 def test_foreign_link_later_in_the_chain_is_refused(monkeypatch, tmp_path, sticky):
@@ -287,3 +429,45 @@ def test_overlong_window_is_skipped_without_cost(tmp_path):
     """A window more than 3x old_str's length cannot reach the quoting threshold."""
     content = "z" * 500_000 + "\nhello world\n"
     assert _closest_match(content, "hello wrld\n")["closest_match"] == "hello world\n"
+
+
+# --- link targets as they occur in the wild -----------------------------------
+def test_relative_link_with_dot_dot_is_written_through(tmp_path):
+    """The common shape: ~/.claude/CLAUDE.md -> ../repos/x/CLAUDE.md."""
+    repo = tmp_path / "repos" / "x"
+    repo.mkdir(parents=True)
+    real = repo / "CLAUDE.md"
+    real.write_text("v1\n")
+    home = tmp_path / "home" / ".claude"
+    home.mkdir(parents=True)
+    lnk = home / "CLAUDE.md"
+    lnk.symlink_to("../../repos/./x/CLAUDE.md")
+    r = edit_file(str(lnk), "v1", "v2")
+    assert r["status"] == "ok"
+    assert lnk.is_symlink()
+    assert real.read_text() == "v2\n"
+    assert r["written_to"] == str(real)
+
+
+def test_path_with_dot_and_dot_dot_components(tmp_path):
+    (tmp_path / "a").mkdir()
+    r = write_file(f"{tmp_path}/a/./../a/f.txt", "x")
+    assert (tmp_path / "a" / "f.txt").read_text() == "x"
+    assert "written_to" not in r
+
+
+def test_relative_link_through_a_linked_directory(tmp_path):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "f").write_text("a\n")
+    (tmp_path / "dirlink").symlink_to("real")
+    (tmp_path / "flink").symlink_to("dirlink/f")
+    write_file(str(tmp_path / "flink"), "b\n")
+    assert (real_dir / "f").read_text() == "b\n"
+
+
+def test_edit_refuses_a_file_that_grows_past_the_limit_while_read(monkeypatch):
+    """/proc files report st_size 0 and then return content."""
+    monkeypatch.setattr(server, "_EDIT_MAX_BYTES", 10)
+    r = edit_file("/proc/self/status", "Name", "x")
+    assert "grew past" in r["error"]

@@ -1,5 +1,6 @@
 """Tests for run_command and the PM2 IPC env-sanitisation fix (HLOPS-1)."""
 
+import shlex
 import time
 
 import psutil
@@ -90,7 +91,7 @@ def test_timeout_applies_after_the_command_closes_its_stdio():
 
 def test_detached_stdio_command_is_killed_at_the_deadline(tmp_path):
     pidfile = tmp_path / "pid"
-    run_command(f"echo $$ > {pidfile}; exec >/dev/null 2>&1; sleep 30", timeout=1)
+    run_command(f"echo $$ > {shlex.quote(str(pidfile))}; exec >/dev/null 2>&1; sleep 30", timeout=1)
     pid = int(pidfile.read_text())
     # Reaped as well as signalled: the pid no longer exists at all.
     assert not psutil.pid_exists(pid)

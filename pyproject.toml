@@ -21,6 +21,12 @@ dependencies = [
     # dependency, declared here only to hold that floor.
     "fastmcp>=3.4.10,<4",
     "mcp>=1.30,<2",
+    # Also security floors, for the two HTTP-facing transitives: an install that
+    # re-resolves into an existing venv (`pip install .`) would otherwise keep
+    # whatever old versions it finds. starlette 1.3.1 fixes PYSEC-2026-248/249;
+    # python-multipart 0.0.31 fixes the advisories through GHSA-v9pg-7xvm-68hf.
+    "starlette>=1.3.1",
+    "python-multipart>=0.0.31",
     "psutil>=6.0",
     "structlog>=24.0",
 ]
@@ -63,8 +69,9 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 source = ["homelab_ops_mcp"]
 
 [tool.coverage.report]
-# Measured 2026-10-25 (v0.5.0 branch): 98.40% total (server.py 100%), identical on
-# Python 3.11, 3.12 and 3.13 and with or without the [telemetry] extra.
+# Measured 2026-10-25 (v0.5.0 branch, after audit remediation): 98.57% total
+# (server.py 100%), identical on Python 3.11, 3.12 and 3.13 and with or without
+# the [telemetry] extra.
 # The floor sits about 4 points under that: high enough that losing a module's
 # tests fails CI, with room for a release that adds code before its last tests.
 # Raised from the repo-standards baseline of 80, which a 98% suite could lose a

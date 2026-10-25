@@ -116,6 +116,14 @@ def check_planted_fails() -> bool:
         subprocess.run([*git[:3], "init", "-q", str(work)], check=True, capture_output=True)
         subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
         subprocess.run([*git, "commit", "-qm", "planted"], check=True, capture_output=True)
+        # Then delete it. The secret now exists only in history, so a detection
+        # proves the scan reads history, which is what the scheduled full-history
+        # job relies on. Left in the tree, a working-tree-only scan would pass too.
+        subprocess.run([*git, "rm", "-q", "planted_secret.py"], check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-qm", "removed"], check=True, capture_output=True)
+        if (work / "planted_secret.py").exists():
+            print("FAIL  the planted file is still in the working tree; the probe is invalid")
+            return False
 
         code = run_gitleaks(work)
         if code == 0:

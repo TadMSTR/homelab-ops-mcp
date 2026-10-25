@@ -152,12 +152,15 @@ def test_empty_list(tmp_path):
 
 
 def test_duplicate_paths_collapse(tmp_path):
-    """Keyed by path, so a repeated path is one entry — and count says so."""
+    """Keyed by path, so a repeated path is one entry, and the counts agree with it.
+
+    count used to be len(paths), which reported a phantom failure (F-09).
+    """
     a = tmp_path / "a.txt"
     a.write_text("A\n")
     r = read_multiple_files([str(a), str(a)])
     assert len(r["files"]) == 1
-    assert r["count"] == 2
+    assert (r["count"], r["ok"], r["failed"]) == (1, 1, 0)
 
 
 # --- execution_time -----------------------------------------------------------

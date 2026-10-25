@@ -4,6 +4,8 @@ Fingerprints: 0523865f5fbb7d8b (start clamp unpinned), 7b1595070a8263ec
 (end_line <= 0), f37b6ce5386cdd83 (no size cap on reads).
 """
 
+import time
+
 import pytest
 
 from homelab_ops_mcp.server import _OUTPUT_LIMIT_ENV_VAR, read_file, read_multiple_files
@@ -104,7 +106,8 @@ def test_full_read_is_capped_and_flagged(tmp_path, small_cap):
     r = read_file(str(p))
     assert len(r["content"].encode()) == small_cap
     assert r["truncated"] is True
-    assert r["total_lines"] == 51
+    # Reading stopped at the cap, so the rest was not counted.
+    assert r["total_lines"] is None
     # Says where it stopped, so the caller can continue from there.
     assert r["returned_lines"] == "1-10"
 
@@ -122,7 +125,7 @@ def test_ranged_read_deep_in_a_capped_file_still_works(tmp_path, small_cap):
     r = read_file(str(p), start_line=400, end_line=402)
     assert r["content"].splitlines() == [f"{i:099d}" for i in (400, 401, 402)]
     assert r["truncated"] is False
-    assert r["total_lines"] == 500
+    assert r["total_lines"] is None
 
 
 def test_read_multiple_files_shares_one_budget(tmp_path, small_cap):
@@ -139,3 +142,58 @@ def test_read_multiple_files_shares_one_budget(tmp_path, small_cap):
     assert "output budget" in files[paths[2]]["error"]
     total = sum(len(f.get("content", "")) for f in files.values())
     assert total == small_cap
+
+
+# --- reading stops when the range or budget is done (CR-01) -------------------
+def test_short_range_at_the_head_of_a_huge_file_does_not_read_it_all(tmp_path):
+    """Measured before: a 5-line range on 200 MB scanned all 2,000,000 lines."""
+    p = tmp_path / "huge"
+    with open(p, "wb") as f:
+        f.write(b"one\ntwo\nthree\n")
+        f.seek(4 * 1024**3)  # sparse: 4 GiB of zeros, no newlines
+        f.write(b"\n")
+    started = time.monotonic()
+    r = read_file(str(p), start_line=1, end_line=2)
+    assert time.monotonic() - started < 1
+    assert r["content"] == "one\ntwo\n"
+    assert r["total_lines"] is None
+
+
+def test_range_reaching_the_end_still_counts_every_line(hundred):
+    r = read_file(str(hundred), start_line=95, end_line=100)
+    assert r["total_lines"] == 100
+
+
+def test_full_read_under_the_cap_counts_every_line(hundred):
+    assert read_file(str(hundred))["total_lines"] == 100
+
+
+# --- the cap counts decoded text (F-06) ---------------------------------------
+def test_invalid_utf8_cannot_return_more_than_the_cap(tmp_path, small_cap):
+    """Each 0xFF becomes U+FFFD (3 bytes); counting raw bytes returned 3x the cap."""
+    p = tmp_path / "binary"
+    p.write_bytes(b"\xff" * 2000)
+    r = read_file(str(p))
+    assert len(r["content"].encode()) <= small_cap
+    assert r["truncated"] is True
+
+
+def test_cap_never_splits_a_character(tmp_path, small_cap):
+    p = tmp_path / "euro"
+    p.write_text("€" * 2000)  # 3 bytes each
+    r = read_file(str(p))
+    assert set(r["content"]) == {"€"}
+    assert len(r["content"].encode()) == 999
+
+
+def test_character_split_across_read_chunks_is_decoded_whole(tmp_path):
+    p = tmp_path / "split"
+    body = "x" * (65536 - 1) + "€" + "\n"  # the € straddles the first readline chunk
+    p.write_text(body)
+    assert read_file(str(p))["content"] == body
+
+
+def test_truncated_utf8_sequence_at_end_of_file(tmp_path):
+    p = tmp_path / "f"
+    p.write_bytes(b"ok\xe2\x82")  # the first two bytes of a three-byte character
+    assert read_file(str(p))["content"] == "ok�"

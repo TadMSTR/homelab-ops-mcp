@@ -54,15 +54,16 @@ control — keep it loopback-bound unless you have a specific reason to expose i
 Loopback alone does not keep a browser out. A web page whose hostname an attacker points
 at `127.0.0.1` (DNS rebinding) is, to the browser, same-origin with this port. The server
 therefore refuses any request whose `Host` header is not a loopback name, with `421`, and
-any request carrying an `Origin` that is not a loopback origin, with `403`:
+any request that carries an `Origin` header at all, with `403`:
 
-| Accepted `Host` | Accepted `Origin` (when sent) |
+| Accepted `Host` | Accepted `Origin` |
 |---|---|
-| `127.0.0.1:*`, `localhost:*`, `[::1]:*` | `http://127.0.0.1:*`, `http://localhost:*`, `http://[::1]:*` |
+| `127.0.0.1:*`, `localhost:*`, `[::1]:*` | none: only browsers send `Origin`, and no browser is a client |
 
 Any port is accepted, not only the bind port: a client that reaches the server through a
-port forward (an SSH tunnel, say) sends the forward's local port. Non-browser clients send
-no `Origin` and are unaffected by that half.
+port forward (an SSH tunnel, say) sends the forward's local port. MCP clients send no
+`Origin` and are unaffected by that half. Loopback origins are refused too: allowing them
+would trust every web app served on the same host.
 
 If you bind `--host 0.0.0.0`, the clients arrive under another name and are refused until
 you list it:
@@ -174,11 +175,12 @@ timeout is the command's outcome and leaves it `null`.
 
 | Behaviour | Detail |
 |---|---|
-| Read cap | `read_file` returns at most `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` of content; past that `truncated` is `true` and `returned_lines` says where it stopped. The file is streamed, so a ranged read deep into a large file works and costs no more memory than the cap. `read_multiple_files` shares one such budget across the whole call. |
+| Read cap | `read_file` returns at most `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` of content, counted as UTF-8 after decoding; past that `truncated` is `true` and `returned_lines` says where it stopped. The file is streamed and reading stops once the range or the budget is done, so a short range costs a short read; `total_lines` is then `null`, since the rest was not counted. `read_multiple_files` shares one budget across the whole call and counts each distinct path once. |
 | Line ranges | `start_line` below 1 is read as 1. `end_line` below 1, or before `start_line`, is an error. A range starting past the end returns empty content with `returned_lines: "none"`. Lines end at LF, as for `wc -l`. |
 | Byte fidelity | `read_file` returns content as it is on disk, CRLF included. `edit_file` rewrites only the matched span; every other byte is kept. In a CRLF file an `old_str` written with LF breaks is matched against its CRLF form and `new_str` is given CRLF breaks (`line_endings: "crlf"` in the result). A file that is not valid UTF-8 is refused by `edit_file` rather than re-encoded. |
-| Symlinks | `write_file` and `edit_file` write *through* a symlink: the link is kept, its target changes, and `written_to` names the file written. |
+| Symlinks | `write_file` and `edit_file` write *through* a symlink: the link is kept, its target changes, and `written_to` names the file written. A link that another user planted in a shared sticky directory such as `/tmp`, anywhere in the path, is refused, as the kernel's `protected_symlinks` rule would. With `create_dirs`, a missing directory the link points into is created. |
 | Hard links | A file with more than one hard link is refused by `write_file` and `edit_file`. Their writes are atomic (temp file and rename), and a rename would detach this name from the others. |
+| What `edit_file` reads | Regular files only, up to 16 MiB. A FIFO, device or directory is refused without blocking, and so is a larger file; use `run_command` for those. |
 | No-match hint | When `edit_file` finds no match it quotes the closest passage. That search is skipped for an `old_str` over 2 KiB or a file over 2 MiB, and gives up after one second, so a failed edit always returns promptly. |
 
 ### Child process environment

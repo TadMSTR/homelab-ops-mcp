@@ -22,17 +22,18 @@ and the referenced-variable log carries only names the caller itself wrote into
 the command text. Pinned by test.
 """
 
+import codecs
 import contextlib
 import difflib
 import functools
 import logging
 import os
 import re
+import secrets
 import selectors
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -260,95 +261,176 @@ def _link_hop_allowed(link_uid: int, dir_mode: int, dir_uid: int, euid: int) -> 
     In a sticky, world-writable directory (``/tmp``), a link is followed only if
     the follower owns it or the link's owner owns the directory. Anyone can
     plant a link in such a directory, so without this rule a write to
-    ``/tmp/report.txt`` could be steered into any file the server can write.
+    ``/tmp/report.txt`` (or ``/tmp/somedir/report.txt``) could be steered into
+    any file the server can write.
     """
     shared = dir_mode & stat.S_ISVTX and dir_mode & stat.S_IWOTH
     return not shared or link_uid in (euid, dir_uid)
 
 
-def _check_link_chain(path: Path) -> None:
-    """Refuse the write if any hop of the final component's link chain is unsafe.
+def _checked_resolve(path: Path) -> Path:
+    """Resolve ``path`` one component at a time, applying the link rule to every link met.
 
-    ``os.path.realpath`` resolves links itself with ``lstat``/``readlink``, so
-    the kernel never follows them and its ``protected_symlinks`` check never
-    runs, and the host may have it switched off anyway. So the rule is applied
-    here, to every hop. Directory components are not re-checked: one owned by
-    someone else can still be swapped between the check and the rename, which
-    is the general limit of path-based writes.
+    ``os.path.realpath`` follows links in userspace, so the kernel's
+    ``protected_symlinks`` check never runs on them, and a host may have it off
+    anyway. Every symlink on the way, in a directory component or the final
+    one and at every hop of a chain, is checked here instead. A component that
+    does not exist ends the walk: nothing below it can be a link, so the rest
+    is joined lexically.
+
+    This is a check, not the resolution the write uses. The write then opens
+    the resolved directory through the kernel (``_open_dir``), so a link
+    swapped in after this walk is still subject to the kernel's rule, and the
+    final component is handled relative to that directory without following
+    links.
     """
-    current = path
-    for _ in range(_MAX_LINK_HOPS):
+    parts = list(path.parts[1:])
+    resolved = Path("/")
+    hops = 0
+    while parts:
+        name = parts.pop(0)  # Path.parts never yields "" or "."
+        if name == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / name
         try:
-            link = os.lstat(current)
+            st = os.lstat(candidate)
         except FileNotFoundError:
-            return
-        if not stat.S_ISLNK(link.st_mode):
-            return
-        parent = os.stat(current.parent)
-        if not _link_hop_allowed(link.st_uid, parent.st_mode, parent.st_uid, os.geteuid()):
+            return Path(os.path.normpath(candidate.joinpath(*parts)))
+        if not stat.S_ISLNK(st.st_mode):
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > _MAX_LINK_HOPS:
+            raise OSError(f"too many levels of symbolic links: {path}")
+        holder = os.stat(resolved)
+        if not _link_hop_allowed(st.st_uid, holder.st_mode, holder.st_uid, os.geteuid()):
             raise UnsafeLinkError(
-                f"{current} is a symlink in a shared sticky directory, owned by neither "
+                f"{candidate} is a symlink in a shared sticky directory, owned by neither "
                 "you nor the directory's owner; it was not followed and nothing was written."
             )
-        current = current.parent / os.readlink(current)
-    raise OSError(f"too many levels of symbolic links: {path}")
+        target = Path(os.readlink(candidate))
+        if target.is_absolute():
+            resolved = Path("/")
+            parts = list(target.parts[1:]) + parts
+        else:
+            parts = list(target.parts) + parts
+    return resolved
 
 
-def _write_target(path: Path) -> Path:
-    """The file a write to ``path`` must land on: through any symlink, never past a hard link.
+def _open_dir(directory: Path, create: bool = False) -> int:
+    """Open ``directory`` through the kernel and return the fd.
 
-    A rename replaces a directory entry, so writing a temp file and renaming it
-    over ``path`` turns a symlink into a regular file and leaves the link's
-    target untouched — while the tool reports success. The contract is
-    therefore *write through*: a symlink (or a chain of them, dangling or not)
-    is resolved and the rename happens next to the real file, so the link
-    survives and its target changes, as ``echo > link`` would.
-
-    A hard link has no "through": every name is the file. Renaming over one
-    name silently detaches it from the others, so that case is refused rather
-    than half-done. A non-atomic in-place write would keep the link, at the
-    cost of the crash safety the rename exists for.
-
-    A link that the kernel's ``protected_symlinks`` rule would refuse to follow
-    (one planted in ``/tmp`` by another user) is refused here too: see
-    ``_check_link_chain``.
+    The kernel walks the path itself, so ``protected_symlinks`` applies to any
+    link in it, including one swapped in after ``_checked_resolve`` looked.
     """
-    _check_link_chain(path)
-    target = Path(os.path.realpath(path))
-    with contextlib.suppress(FileNotFoundError):
-        st = os.stat(target)
-        if st.st_nlink > 1:
-            raise LinkedFileError(
-                f"{path} has {st.st_nlink} hard links; an atomic write would detach this "
-                "name from the others, so nothing was written. Edit it with run_command "
-                "(which writes in place) if that is what you want."
-            )
-    return target
+    if create:
+        os.makedirs(directory, exist_ok=True)
+    return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
 
 
-def _atomic_write(path: Path, data: bytes) -> tuple[int, Path]:
-    """Write ``data`` to ``path`` atomically; return the byte count and the file written.
+class _Target:
+    """Where a write to a path lands: an open directory fd, a name in it, and its state."""
 
-    Writes to a temp file in the same directory (so ``os.replace`` stays on one
-    filesystem), then renames over the target — a crash mid-write leaves either
-    the old file or the new one, never a truncated mix. The mode of an existing
-    target is preserved; new files keep the secure 0600 mode from ``mkstemp``.
-    Symlinks are written through and hard-linked files refused: see
-    ``_write_target``.
+    def __init__(self, path: Path, create_dirs: bool = False):
+        self.resolved = _checked_resolve(path)
+        self.name = self.resolved.name
+        self.dfd = _open_dir(self.resolved.parent, create_dirs)
+        try:
+            try:
+                self.st = os.stat(self.name, dir_fd=self.dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                self.st = None
+            if self.st is not None and stat.S_ISDIR(self.st.st_mode):
+                raise IsADirectoryError(f"{path} is a directory")
+            if self.st is not None and stat.S_ISREG(self.st.st_mode) and self.st.st_nlink > 1:
+                raise LinkedFileError(
+                    f"{path} has {self.st.st_nlink} hard links; an atomic write would detach "
+                    "this name from the others, so nothing was written. Edit it with "
+                    "run_command (which writes in place) if that is what you want."
+                )
+        except BaseException:
+            os.close(self.dfd)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.dfd)
+        return False
+
+
+def _create_temp(dfd: int, name: str) -> tuple[int, str]:
+    """Create a private temp file beside ``name`` in ``dfd``, never through a link."""
+    while True:
+        tmp = f".{name}.{secrets.token_hex(6)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            return os.open(tmp, flags, 0o600, dir_fd=dfd), tmp
+        except FileExistsError:  # pragma: no cover — 48 random bits colliding
+            continue
+
+
+def _write_into(target: _Target, data: bytes) -> int:
+    """Write ``data`` atomically to ``target``; return the byte count.
+
+    Temp file in the same directory (so the rename stays on one filesystem),
+    then a rename over the name — a crash leaves the old file or the new one,
+    never a truncated mix. The rename replaces the directory entry and never
+    follows a link, so a link planted at the name after the check is replaced,
+    not written through. An existing file's mode is kept; a new file is 0600.
     """
-    path = _write_target(path)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = _create_temp(target.dfd, target.name)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        with contextlib.suppress(OSError):
-            os.chmod(tmp, os.stat(path).st_mode & 0o777)
-        os.replace(tmp, path)
+            if target.st is not None and stat.S_ISREG(target.st.st_mode):
+                os.fchmod(f.fileno(), target.st.st_mode & 0o777)
+        os.replace(tmp, target.name, src_dir_fd=target.dfd, dst_dir_fd=target.dfd)
     except BaseException:
         with contextlib.suppress(OSError):
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=target.dfd)
         raise
-    return len(data), path
+    return len(data)
+
+
+# Whole-file reads for edit_file. read_file streams; an edit needs the file in
+# memory, so it is refused past this size rather than allowed to exhaust the
+# process every client shares.
+_EDIT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _read_regular(target: _Target) -> bytes:
+    """Read a regular file named in ``target``: no links followed, no FIFOs, bounded.
+
+    ``O_NONBLOCK`` so a FIFO cannot block the open, ``O_NOFOLLOW`` so a link
+    swapped in since the check is refused rather than followed, and ``fstat`` on
+    what was actually opened decides whether it is a regular file.
+    """
+    limit = _EDIT_MAX_BYTES
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fd = os.open(target.name, flags, dir_fd=target.dfd)
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{target.resolved} is not a regular file")
+        if st.st_size > limit:
+            raise OSError(
+                f"{target.resolved} is {st.st_size} bytes, over edit_file's {limit}-byte "
+                "limit; nothing was changed. Use run_command for a file this size."
+            )
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(f"{target.resolved} grew past edit_file's {limit}-byte limit while read")
+    return data
+
+
+def _written_to(path: Path, target: _Target) -> dict:
+    """``{"written_to": ...}`` when the write landed somewhere other than ``path`` itself."""
+    if target.resolved != Path(os.path.normpath(path)):
+        return {"written_to": str(target.resolved)}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -636,29 +718,43 @@ def _read_lines_capped(path: Path, first: int, last: int | None, limit: int) -> 
     """Stream ``path`` and return lines ``first``..``last`` (1-indexed), at most ``limit`` bytes.
 
     The file is read in bounded chunks rather than whole, so memory stays at
-    about ``limit`` however large the file is, and a short range costs a scan
-    rather than a copy of the file. Every line is still counted, because
-    ``total_lines`` is part of the response.
+    about ``limit`` however large the file is. Reading stops as soon as the
+    range is complete or the budget is spent, so a short range near the start
+    of a huge file costs a short read; ``total_lines`` is then None, because
+    the rest of the file was not counted.
+
+    ``limit`` counts the returned text as UTF-8, after decoding: an invalid
+    byte becomes U+FFFD, three bytes, so counting raw bytes would let a binary
+    file return three times the cap.
 
     Lines end at LF only, the same as ``wc -l`` and ``sed -n``, and the bytes
     are returned as they are on disk: a CRLF file reads back with its CRs, so
     what ``read_file`` shows is what ``edit_file`` will match.
-    Invalid UTF-8 is shown as U+FFFD; nothing is written back.
     """
-    out = bytearray()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pieces: list[str] = []
+    used = 0
     truncated = False
+    complete = True
     returned_first = returned_last = None
     line_no = 1
     pending = False  # the current line has bytes but no newline yet
     with open(path, "rb") as f:
         while chunk := f.readline(_READ_CHUNK):
-            if line_no >= first and (last is None or line_no <= last) and not truncated:
-                room = limit - len(out)
-                if len(chunk) > room:
-                    out.extend(chunk[:room])
+            if truncated or (last is not None and line_no > last):
+                complete = False  # there is more file, and it was not read
+                break
+            if line_no >= first:
+                room = limit - used
+                text = decoder.decode(chunk)
+                encoded = text.encode()
+                if len(encoded) > room:
+                    # Cut on a character boundary, never mid-sequence.
+                    text = encoded[:room].decode(errors="ignore")
+                    encoded = text.encode()
                     truncated = True
-                else:
-                    out.extend(chunk)
+                pieces.append(text)
+                used += len(encoded)
                 # A line counts as returned only if some of it was: a budget
                 # that runs out exactly on a line boundary returns no part of
                 # the next one.
@@ -671,9 +767,13 @@ def _read_lines_capped(path: Path, first: int, last: int | None, limit: int) -> 
                 pending = False
             else:
                 pending = True
-    total = line_no if pending else line_no - 1
+    if not truncated:
+        tail = decoder.decode(b"", final=True)  # a dangling partial sequence
+        if tail and len(tail.encode()) <= limit - used:
+            pieces.append(tail)
+    total = (line_no if pending else line_no - 1) if complete else None
     return {
-        "content": out.decode(errors="replace"),
+        "content": "".join(pieces),
         "total_lines": total,
         "first": returned_first,
         "last": returned_last,
@@ -742,9 +842,11 @@ def read_file(
         end_line: Last line to return (1-indexed, inclusive). Omit for end of file.
             Must be at least 1 and not less than start_line.
 
-    At most SYSTEM_OPS_OUTPUT_LIMIT_BYTES (default 1 MiB) of content is returned.
-    Past that ``truncated`` is true and ``returned_lines`` says where it stopped;
-    read the rest with a later ``start_line``. Content is returned byte for byte
+    At most SYSTEM_OPS_OUTPUT_LIMIT_BYTES (default 1 MiB) of content is returned,
+    counted as UTF-8. Past that ``truncated`` is true and ``returned_lines`` says
+    where it stopped; read the rest with a later ``start_line``. Reading stops
+    once the range or the budget is done, and ``total_lines`` is then null
+    (the rest of the file was not counted). Content is returned byte for byte
     (CRLF stays CRLF); invalid UTF-8 is shown as U+FFFD.
     """
     return _read_file(path, start_line, end_line, _output_limit())
@@ -781,9 +883,11 @@ def read_multiple_files(paths: list[str]) -> dict:
             continue
         results[path] = _read_file(path, None, None, budget)
         budget -= len(results[path].get("content", "").encode(errors="replace"))
+    # Counted over the distinct paths actually reported: a repeated path is
+    # read once, and counting it twice made a phantom failure with no entry.
     ok = sum(1 for r in results.values() if "error" not in r)
-    log.info("read_multiple_files.done", count=len(paths), ok=ok)
-    return {"count": len(paths), "ok": ok, "failed": len(paths) - ok, "files": results}
+    log.info("read_multiple_files.done", count=len(results), ok=ok)
+    return {"count": len(results), "ok": ok, "failed": len(results) - ok, "files": results}
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +913,9 @@ def write_file(
     The write is atomic (temp file + rename). If ``path`` is a symlink the write
     goes through it to the real file, the link is kept, and ``written_to`` names
     the file written. A file with more than one hard link is refused, since a
-    rename would detach this name from the others.
+    rename would detach this name from the others. So is a path through a
+    symlink that another user planted in a shared sticky directory such as
+    /tmp, the case the kernel's protected_symlinks rule exists for.
 
     Args:
         path: Absolute path to the file.
@@ -818,16 +924,17 @@ def write_file(
     """
     try:
         p = _resolve_path(path)
-        if create_dirs:
-            p.parent.mkdir(parents=True, exist_ok=True)
-        written, target = _atomic_write(p, content.encode())
-        log.info("write_file.done", path=path, bytes_written=written)
-        result = {"path": path, "bytes_written": written}
-        if target != p:
-            result["written_to"] = str(target)
-        return result
+        # create_dirs applies to the directory the write lands in, so a link to
+        # a file in a directory that does not exist yet gets that directory.
+        with _Target(p, create_dirs=create_dirs) as target:
+            written = _write_into(target, content.encode())
+            log.info("write_file.done", path=path, bytes_written=written)
+            return {"path": path, "bytes_written": written, **_written_to(p, target)}
     except PathValidationError as e:
         log.warning("write_file.invalid_path", path=path)
+        return {"error": str(e)}
+    except UnsafeLinkError as e:
+        log.warning("write_file.unsafe_link_refused", path=path)
         return {"error": str(e)}
     except PermissionError:
         log.warning("write_file.permission_denied", path=path)
@@ -949,8 +1056,9 @@ def edit_file(
     written back as it was. In a CRLF file, an old_str written with plain LF
     line breaks is matched against the CRLF form, and new_str is given CRLF
     breaks to match (``line_endings`` is then "crlf"). A file that is not valid
-    UTF-8 is refused rather than re-encoded. Symlinks and hard links are
-    handled as in write_file.
+    UTF-8 is refused rather than re-encoded, as is anything that is not a
+    regular file or is over 16 MiB. Symlinks and hard links are handled as in
+    write_file.
 
     Args:
         path: Absolute path to the file.
@@ -960,73 +1068,88 @@ def edit_file(
     """
     try:
         p = _resolve_path(path)
-        if not p.exists():
-            return {"error": f"File not found: {path}"}
-
-        raw = p.read_bytes()
-        try:
-            # Strict, and without newline translation: the file is rewritten from
-            # this string, so any lossy step here would change bytes the edit
-            # never touched.
-            original = raw.decode("utf-8")
-        except UnicodeDecodeError as e:
-            log.info("edit_file.not_utf8", path=path)
-            return {
-                "error": f"File is not valid UTF-8 (byte {e.start}); edit_file would have "
-                "to re-encode it, so no changes were made. Use run_command for this file."
-            }
-        count = original.count(old_str)
-        crlf = False
-        if count == 0 and "\r\n" in original and "\n" in old_str and "\r" not in old_str:
-            crlf_old = old_str.replace("\n", "\r\n")
-            crlf_count = original.count(crlf_old)
-            if crlf_count:
-                old_str, count, crlf = crlf_old, crlf_count, True
-                if "\r" not in new_str:
-                    new_str = new_str.replace("\n", "\r\n")
-
-        if count == 0:
-            result = {"error": "old_str not found in file. No changes made."}
-            hint = _closest_match(original, old_str)
-            if hint:
-                result.update(hint)
-            log.info("edit_file.no_match", path=path, had_hint=bool(hint))
-            return result
-        if count > 1:
-            return {
-                "error": f"old_str matched {count} times. Must match exactly once. No changes made."
-            }
-
-        updated = original.replace(old_str, new_str, 1)
-        extra = {"line_endings": "crlf"} if crlf else {}
-        if dry_run:
-            # Resolve the target anyway, so a hard-linked file fails the dry run
-            # the same way it would fail the real one.
-            _write_target(p)
-            log.info("edit_file.dry_run", path=path, matches_replaced=1)
-            return {
-                "path": path,
-                "status": "ok",
-                "matches_replaced": 1,
-                "dry_run": True,
-                "bytes_before": len(raw),
-                "bytes_after": len(updated.encode()),
-                **extra,
-            }
-        _, target = _atomic_write(p, updated.encode())
-        if target != p:
-            extra["written_to"] = str(target)
-        log.info("edit_file.done", path=path, matches_replaced=1)
-        return {"path": path, "status": "ok", "matches_replaced": 1, "dry_run": False, **extra}
+        with _Target(p) as target:
+            if target.st is None:
+                return {"error": f"File not found: {path}"}
+            return _edit(p, target, old_str, new_str, dry_run)
     except PathValidationError as e:
         log.warning("edit_file.invalid_path", path=path)
+        return {"error": str(e)}
+    except UnsafeLinkError as e:
+        log.warning("edit_file.unsafe_link_refused", path=path)
         return {"error": str(e)}
     except PermissionError:
         log.warning("edit_file.permission_denied", path=path)
         return {"error": f"Permission denied: {path}"}
+    except FileNotFoundError:
+        return {"error": f"File not found: {path}"}
     except Exception as e:
         log.error("edit_file.error", path=path, error=str(e))
         return {"error": str(e)}
+
+
+def _edit(p: Path, target: _Target, old_str: str, new_str: str, dry_run: bool) -> dict:
+    """``edit_file``'s body, against a target already resolved and checked."""
+    path = str(p)
+    raw = _read_regular(target)
+    try:
+        # Strict, and without newline translation: the file is rewritten from
+        # this string, so any lossy step here would change bytes the edit
+        # never touched.
+        original = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        log.info("edit_file.not_utf8", path=path)
+        return {
+            "error": f"File is not valid UTF-8 (byte {e.start}); edit_file would have "
+            "to re-encode it, so no changes were made. Use run_command for this file."
+        }
+    count = original.count(old_str)
+    crlf = False
+    if count == 0 and "\r\n" in original and "\n" in old_str and "\r" not in old_str:
+        crlf_old = old_str.replace("\n", "\r\n")
+        crlf_count = original.count(crlf_old)
+        if crlf_count:
+            old_str, count, crlf = crlf_old, crlf_count, True
+            if "\r" not in new_str:
+                new_str = new_str.replace("\n", "\r\n")
+
+    if count == 0:
+        result = {"error": "old_str not found in file. No changes made."}
+        hint = _closest_match(original, old_str)
+        if hint:
+            result.update(hint)
+        log.info("edit_file.no_match", path=path, had_hint=bool(hint))
+        return result
+    if count > 1:
+        return {
+            "error": f"old_str matched {count} times. Must match exactly once. No changes made."
+        }
+
+    updated = original.replace(old_str, new_str, 1)
+    extra = {"line_endings": "crlf"} if crlf else {}
+    if dry_run:
+        # The target was resolved and checked already, so a hard-linked file
+        # or an unsafe link fails the dry run the same way as the real one.
+        log.info("edit_file.dry_run", path=path, matches_replaced=1)
+        return {
+            "path": path,
+            "status": "ok",
+            "matches_replaced": 1,
+            "dry_run": True,
+            "bytes_before": len(raw),
+            "bytes_after": len(updated.encode()),
+            **extra,
+        }
+    _write_into(target, updated.encode())
+    log.info("edit_file.done", path=path, matches_replaced=1)
+    return {
+        "path": path,
+        "status": "ok",
+        "matches_replaced": 1,
+        "dry_run": False,
+        **extra,
+        **_written_to(p, target),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1161,20 +1284,22 @@ def _transport_security_settings() -> TransportSecuritySettings:
     """Loopback names on any port, plus exact Host values from ``SYSTEM_OPS_ALLOWED_HOSTS``.
 
     The extra entries exist for ``--host 0.0.0.0`` deployments, whose clients
-    arrive under another name (``host.docker.internal:8282``, say). They are
-    Host values only: no browser is a legitimate client, so no extra Origin is
-    allowed. A request with no Origin header — every non-browser client — is
-    accepted by mcp's check.
+    arrive under another name (``host.docker.internal:8282``, say).
+
+    No Origin is allowed at all. No browser is a legitimate client, and only
+    browsers send Origin, so a request carrying one is refused (403) whatever
+    it names. Allowing loopback origins would have trusted every web app
+    served on this host. A request without the header, which is every MCP
+    client, passes mcp's check.
     """
     hosts = [f"{name}:*" for name in _LOOPBACK_NAMES]
-    origins = [f"http://{name}:*" for name in _LOOPBACK_NAMES]
     for entry in os.environ.get(_ALLOWED_HOSTS_ENV_VAR, "").split(","):
         if entry.strip():
             hosts.append(entry.strip())
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=hosts,
-        allowed_origins=origins,
+        allowed_origins=[],
     )
 
 

@@ -72,9 +72,16 @@ def test_foreign_origin_is_refused(client):
     assert r.status_code == 403
 
 
-def test_loopback_origin_is_served(client):
-    r = _post(client, host="localhost:8282", origin="http://localhost:8282")
-    assert r.status_code == 200
+@pytest.mark.parametrize(
+    "origin", ["http://localhost:8282", "http://localhost:7777", "http://127.0.0.1:3005", "null"]
+)
+def test_any_origin_is_refused_even_a_loopback_one(client, origin):
+    """Only browsers send Origin, and no browser is a client (F-07).
+
+    Allowing loopback origins trusted every web app served on this host.
+    """
+    r = _post(client, host="localhost:8282", origin=origin)
+    assert r.status_code == 403
 
 
 def test_extra_host_from_env(client, monkeypatch):

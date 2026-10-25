@@ -4,20 +4,24 @@
 
 Behaviour changes worth reading before upgrading:
 
-1. **Requests whose `Host` is not a loopback name are refused** (`421`), as are browser
-   requests with a non-loopback `Origin` (`403`). Clients connecting to `localhost`,
+1. **Requests whose `Host` is not a loopback name are refused** (`421`), as are requests
+   carrying any `Origin` header (`403`), which only browsers send. Clients connecting to `localhost`,
    `127.0.0.1` or `[::1]`, on any port, are unaffected. A `--host 0.0.0.0` deployment
    reached under another name must list it in `SYSTEM_OPS_ALLOWED_HOSTS`.
 2. **`write_file` and `edit_file` write through symlinks** instead of replacing the link
-   with a regular file, and **refuse a hard-linked file** instead of splitting it.
+   with a regular file, and **refuse a hard-linked file** instead of splitting it. A path
+   through a symlink another user planted in a shared sticky directory (`/tmp`) is refused.
+   `edit_file` reads only regular files up to 16 MiB.
 3. **`edit_file` refuses a file that is not valid UTF-8**, and no longer rewrites line
    endings or bytes outside the matched span.
 4. **`read_file` returns content as it is on disk**, CRLF included (it used to translate
    line endings), counts lines at LF only, and is capped at
-   `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB) with a `truncated` flag.
+   `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB, counted as UTF-8) with a `truncated`
+   flag. Reading stops once the range or cap is done, and `total_lines` is then `null`.
 5. **`read_file` refuses `end_line` below 1 or before `start_line`.** `end_line=0` used to
    return the whole file and a negative value used to drop lines from the end.
-6. **Dependency floors raised:** `fastmcp>=3.4.10,<4` and `mcp>=1.30,<2`.
+6. **Dependency floors raised:** `fastmcp>=3.4.10,<4`, `mcp>=1.30,<2`,
+   `starlette>=1.3.1`, `python-multipart>=0.0.31`.
 
 ### Security
 
@@ -37,7 +41,12 @@ Behaviour changes worth reading before upgrading:
   file), holding the GIL and slowing every other client. It is now skipped for an
   `old_str` over 2 KiB and gives up after one second. `read_file` and
   `read_multiple_files` had no size bound; they now stream the file and share the
-  `run_command` byte cap.
+  `run_command` byte cap. `edit_file` no longer reads a FIFO (which blocked a worker
+  forever) or an unbounded file.
+- **Writes are not steered by another user's links.** Resolving a symlink in Python
+  bypasses the kernel's `protected_symlinks` rule. `write_file` and `edit_file` apply
+  that rule to every link in the path, then do the write relative to a directory the
+  kernel opened, so a link planted in `/tmp` cannot redirect a write elsewhere.
 
 ### Fixed
 
@@ -75,7 +84,7 @@ Behaviour changes worth reading before upgrading:
   pinned) on pushes to main and PRs, and weekly over full history. It first proves the
   gate fires on a planted secret (`tests/check_gitleaks_gate.py`).
 - **Dependabot** maintains `uv.lock` and the action pins.
-- **Coverage floor raised from 80% to 94%**, against a measured 98.40%.
+- **Coverage floor raised from 80% to 94%**, against a measured 98.57%.
 - README badges; `*.key` / `*.pem` ignored; SECURITY.md scope rewritten for what this
   server is; ARCHITECTURE.md, AGENTS.md and CONTRIBUTING.md brought up to date.
 
