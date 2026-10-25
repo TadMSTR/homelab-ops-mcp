@@ -1,5 +1,10 @@
 """Tests for run_command and the PM2 IPC env-sanitisation fix (HLOPS-1)."""
 
+import time
+
+import psutil
+import pytest
+
 from homelab_ops_mcp import server
 from homelab_ops_mcp.server import _PM2_IPC_ENV_VARS, _clean_env, run_command
 
@@ -67,3 +72,84 @@ def test_run_command_exception_path(monkeypatch):
     r = run_command("echo hi")
     assert r["exit_code"] == -1
     assert "subprocess exploded" in r["stderr"]
+
+
+# --- the timeout bounds the exit, not just the pipes (28af99c350d74f2f) -------
+def test_timeout_applies_after_the_command_closes_its_stdio():
+    """``exec >/dev/null 2>&1`` hits EOF on both pipes at once and keeps running.
+
+    The deadline used to be checked only while a pipe was open, after which
+    proc.wait() blocked with no bound and nothing was killed.
+    """
+    started = time.monotonic()
+    r = run_command("exec >/dev/null 2>&1; sleep 6", timeout=1)
+    assert time.monotonic() - started < 4
+    assert r["exit_code"] == -1
+    assert "timed out" in r["stderr"]
+
+
+def test_detached_stdio_command_is_killed_at_the_deadline(tmp_path):
+    pidfile = tmp_path / "pid"
+    run_command(f"echo $$ > {pidfile}; exec >/dev/null 2>&1; sleep 30", timeout=1)
+    pid = int(pidfile.read_text())
+    # Reaped as well as signalled: the pid no longer exists at all.
+    assert not psutil.pid_exists(pid)
+
+
+def test_detached_stdio_command_that_finishes_in_time_reports_its_exit():
+    r = run_command("exec >/dev/null 2>&1; exit 4", timeout=5)
+    assert r["exit_code"] == 4
+    assert r["error"] is None
+
+
+def test_unreapable_child_does_not_hang_the_call(monkeypatch):
+    """After SIGKILL the reap is bounded too (a D-state process cannot be reaped)."""
+    real_popen = server.subprocess.Popen
+
+    class Stuck(real_popen):
+        def wait(self, timeout=None):
+            raise server.subprocess.TimeoutExpired(self.args, timeout)
+
+    monkeypatch.setattr(server.subprocess, "Popen", Stuck)
+    r = run_command("exec >/dev/null 2>&1; sleep 30", timeout=1)
+    assert r["exit_code"] == -1
+    assert "timed out" in r["stderr"]
+
+
+# --- one response shape; tool failures set error (478494ad697df5d2) ----------
+KEYS = {"stdout", "stderr", "exit_code", "truncated", "execution_time", "error"}
+
+
+def test_invalid_cwd_has_the_full_shape_and_an_error():
+    r = run_command("true", cwd="relative/dir")
+    assert set(r) == KEYS
+    assert r["exit_code"] == -1
+    assert "absolute" in r["error"]
+    assert r["truncated"] is False
+
+
+def test_spawn_failure_sets_error(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("EMFILE")
+
+    monkeypatch.setattr(server.subprocess, "Popen", boom)
+    r = run_command("true")
+    assert set(r) == KEYS
+    assert r["error"] == "EMFILE"
+
+
+def test_missing_cwd_directory_sets_error(tmp_path):
+    r = run_command("true", cwd=str(tmp_path / "gone"))
+    assert set(r) == KEYS
+    assert r["error"]
+
+
+@pytest.mark.parametrize(
+    ("command", "timeout"),
+    [("true", 5), ("exit 3", 5), ("echo x 1>&2", 5), ("sleep 5", 1)],
+)
+def test_command_outcomes_have_the_full_shape_and_no_error(command, timeout):
+    """A non-zero exit or a timeout is the command's outcome; the tool worked."""
+    r = run_command(command, timeout=timeout)
+    assert set(r) == KEYS
+    assert r["error"] is None

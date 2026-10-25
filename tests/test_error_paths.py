@@ -20,14 +20,15 @@ def _raise(exc):
 
 
 # --- read_file ---------------------------------------------------------------
+# read_file streams the file through _read_lines_capped; fail there.
 def test_read_file_permission_denied(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(PermissionError()))
+    monkeypatch.setattr(server, "_read_lines_capped", _raise(PermissionError()))
     r = read_file(str(sample_file))
     assert "permission denied" in r["error"].lower()
 
 
 def test_read_file_generic_error(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(ValueError("boom")))
+    monkeypatch.setattr(server, "_read_lines_capped", _raise(ValueError("boom")))
     r = read_file(str(sample_file))
     assert r["error"] == "boom"
 
@@ -47,14 +48,15 @@ def test_write_file_generic_error(monkeypatch, tmp_path):
 
 
 # --- edit_file ---------------------------------------------------------------
+# edit_file reads raw bytes, so the round-trip is lossless; fail there.
 def test_edit_file_permission_denied(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(PermissionError()))
+    monkeypatch.setattr(server.Path, "read_bytes", _raise(PermissionError()))
     r = edit_file(str(sample_file), "line1", "X")
     assert "permission denied" in r["error"].lower()
 
 
 def test_edit_file_generic_error(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(RuntimeError("kaboom")))
+    monkeypatch.setattr(server.Path, "read_bytes", _raise(RuntimeError("kaboom")))
     r = edit_file(str(sample_file), "line1", "X")
     assert r["error"] == "kaboom"
 

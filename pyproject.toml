@@ -4,13 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "homelab-ops-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Shell and file access MCP server for the homelab ops agent"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=3.2",
+    # Capped below 4: a fresh resolve of ">=3.2" picked fastmcp 4.x, a major this server
+    # has never run on. uv.lock pins what is tested and deployed; the CI `latest` job
+    # resolves the newest versions these ranges allow, so a forward-compat break shows
+    # up there rather than at the next deploy. Moving to 4.x is its own change.
+    #
+    # Floors are security floors (2026-10-25): fastmcp 3.4.10 fixes GHSA-7xgj-8392-5q4r;
+    # mcp 1.30.0 fixes CVE-2026-59951 (StreamableHTTP session accumulation, the
+    # transport this server runs) and PYSEC-2026-3481/3482/3483. mcp is a transitive
+    # dependency, declared here only to hold that floor.
+    "fastmcp>=3.4.10,<4",
+    "mcp>=1.30,<2",
     "psutil>=6.0",
     "structlog>=24.0",
 ]
@@ -53,6 +63,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 source = ["homelab_ops_mcp"]
 
 [tool.coverage.report]
-# Repo-standards baseline 80% floor.
-fail_under = 80
+# Measured 2026-10-25 (v0.5.0 branch): 98.40% total (server.py 100%), identical on
+# Python 3.11, 3.12 and 3.13 and with or without the [telemetry] extra.
+# The floor sits about 4 points under that: high enough that losing a module's
+# tests fails CI, with room for a release that adds code before its last tests.
+# Raised from the repo-standards baseline of 80, which a 98% suite could lose a
+# whole tool's tests without noticing. Re-measure when moving it.
+fail_under = 94
 show_missing = true

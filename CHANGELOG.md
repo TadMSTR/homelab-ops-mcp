@@ -1,5 +1,94 @@
 # Changelog
 
+## [0.5.0] — 2026-10-25
+
+Behaviour changes worth reading before upgrading:
+
+1. **Requests whose `Host` is not a loopback name are refused** (`421`), as are browser
+   requests with a non-loopback `Origin` (`403`). Clients connecting to `localhost`,
+   `127.0.0.1` or `[::1]`, on any port, are unaffected. A `--host 0.0.0.0` deployment
+   reached under another name must list it in `SYSTEM_OPS_ALLOWED_HOSTS`.
+2. **`write_file` and `edit_file` write through symlinks** instead of replacing the link
+   with a regular file, and **refuse a hard-linked file** instead of splitting it.
+3. **`edit_file` refuses a file that is not valid UTF-8**, and no longer rewrites line
+   endings or bytes outside the matched span.
+4. **`read_file` returns content as it is on disk**, CRLF included (it used to translate
+   line endings), counts lines at LF only, and is capped at
+   `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` (default 1 MiB) with a `truncated` flag.
+5. **`read_file` refuses `end_line` below 1 or before `start_line`.** `end_line=0` used to
+   return the whole file and a negative value used to drop lines from the end.
+6. **Dependency floors raised:** `fastmcp>=3.4.10,<4` and `mcp>=1.30,<2`.
+
+### Security
+
+- **DNS-rebinding protection.** The server is unauthenticated and relies on loopback
+  reach, which a browser on the same host does not respect: a page whose hostname is
+  re-pointed at `127.0.0.1` is same-origin with the port. mcp's own
+  `TransportSecurityMiddleware` check now runs in front of the app with loopback names
+  allowed on any port (so clients behind a port forward keep working). FastMCP builds
+  the transport with that check switched off, and its own guard is also off by default.
+- **Dependencies moved off published advisories.** fastmcp 3.4.10 fixes
+  GHSA-7xgj-8392-5q4r; mcp 1.30.0 fixes CVE-2026-59951 (StreamableHTTP session
+  accumulation, the transport this server runs) and PYSEC-2026-3481/3482/3483. CI never
+  saw them: `pip-audit .` re-resolved the declared ranges to the newest releases rather
+  than auditing what was installed. The audit now runs against the lock.
+- **Bounded work on the shared process.** `edit_file`'s closest-match hint could run for
+  minutes on an ordinary stale `old_str` (168 s measured for 2 KiB against an 80 KiB
+  file), holding the GIL and slowing every other client. It is now skipped for an
+  `old_str` over 4 KiB and gives up after one second. `read_file` and
+  `read_multiple_files` had no size bound; they now stream the file and share the
+  `run_command` byte cap.
+
+### Fixed
+
+- **`run_command`'s timeout now bounds the command's exit, not just its output.** A
+  command that redirected its own stdio (`exec >>"$LOG" 2>&1; …`) closed both pipes at
+  once; the deadline then stopped applying, `wait()` blocked without limit and nothing
+  was killed. The process group is now killed at the deadline either way, and the reap
+  after the kill is itself bounded.
+- **`write_file` / `edit_file` on a symlink** replaced the link with a regular copy and
+  left its target untouched, while reporting success. Writes now resolve the link and
+  report the file written in `written_to`. A file with more than one hard link is
+  refused, since the atomic rename would detach it from its other names.
+- **`edit_file` round-trip was lossy across the whole file:** CRLF became LF and every
+  non-UTF-8 byte became U+FFFD, for a one-line edit. Only the matched span changes now.
+  In a CRLF file an `old_str` written with LF breaks is matched against its CRLF form,
+  and `new_str` follows (`line_endings: "crlf"` in the result).
+- **`run_command` failures counted as successes in telemetry.** A refused `cwd` or a
+  command that could not be started set no `error`, and the refused-`cwd` response also
+  lacked `execution_time` and `truncated`. Every response now has the same six keys, and
+  `error` is set exactly when the tool itself failed.
+- **`read_file` ranges:** a range starting past the end reports `returned_lines: "none"`
+  instead of an inverted label, and a budget that runs out on a line boundary no longer
+  claims the next line.
+- **Telemetry sinks are drained on shutdown.** `main()` never called
+  `telemetry.shutdown()`, so InfluxDB/NATS records queued at exit were dropped.
+
+### Changed
+
+- **`uv.lock` committed**, and CI installs from it (`uv sync --frozen`), so a green run is
+  about the versions that ship. New CI jobs: the suite with the `[telemetry]` extra
+  installed, a gating run against the newest versions the ranges allow (plus a weekly
+  schedule so it meets new releases without a PR), `uv lock --check`, a pip-audit of the
+  locked runtime and dev sets, and a wheel build-and-import check.
+- **Secret scanning:** `secret-scan.yml` runs gitleaks (version and artefact digest
+  pinned) on pushes to main and PRs, and weekly over full history. It first proves the
+  gate fires on a planted secret (`tests/check_gitleaks_gate.py`).
+- **Dependabot** maintains `uv.lock` and the action pins.
+- **Coverage floor raised from 80% to 94%**, against a measured 98.40%.
+- README badges; `*.key` / `*.pem` ignored; SECURITY.md scope rewritten for what this
+  server is; ARCHITECTURE.md, AGENTS.md and CONTRIBUTING.md brought up to date.
+
+### Tests
+
+- The telemetry missing-dependency tests now simulate the missing extra
+  (`sys.modules[...] = None`) instead of relying on it being absent. They used to pass
+  only where `[telemetry]` was not installed, proving nothing in CI and failing in any
+  venv that had it. They also assert the import-failure warning, so they can only pass
+  through the branch they are named for.
+- `read_file`'s start-line clamp is pinned by a case where an unclamped slice gives a
+  different answer; `list_processes` tests no longer pass on an empty result.
+
 ## [0.4.0] — 2026-09-19
 
 ### Added

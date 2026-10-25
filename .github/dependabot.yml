@@ -1,0 +1,43 @@
+# Dependabot configuration. Arrives in the same change as uv.lock: a lock with nothing
+# maintaining it is a freeze, not a pin. It pins today's vulnerabilities along with
+# today's versions.
+#
+# The ecosystem is `uv`, not `pip`: `pip` would update pyproject.toml and leave uv.lock
+# frozen (F11). No `docker` ecosystem; this repo has no Dockerfile.
+#
+# Majors are ignored. A semver-major bump is a reading task, and the bounded ranges in
+# pyproject.toml already stop one arriving silently (fastmcp is capped below 4).
+version: 2
+
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # A dependency joins the FIRST group it matches. `dev-tools` names the `dev` extra's
+    # members because Dependabot's "development" type is uv's [dependency-groups], not a
+    # [project.optional-dependencies] extra. Add a tool here when you add it to the
+    # extra. `opentelemetry` moves as one family.
+    #
+    # At the open-PR limit a further update is not raised rather than queued, so a quiet
+    # Dependabot is not by itself evidence of being up to date.
+    groups:
+      opentelemetry:
+        patterns: ["opentelemetry-*"]
+      dev-tools:
+        patterns: ["ruff", "pytest", "pytest-*", "pip-audit"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Explicit rather than the default of 5. Three distinct actions are pinned today;
+    # past the limit an update is silently not raised.
+    open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]

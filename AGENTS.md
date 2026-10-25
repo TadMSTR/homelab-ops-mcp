@@ -20,16 +20,24 @@ Exposes seven tools:
 src/homelab_ops_mcp/
 ├── __init__.py   # Package version
 ├── logging.py    # structlog JSON logging (LOG_LEVEL / LOG_FILE)
-└── server.py     # FastMCP app, all tool definitions, main() entry point
+├── server.py     # FastMCP app, all tool definitions, Host/Origin guard, main()
+├── telemetry.py  # Optional OTLP / InfluxDB 3 / NATS signals, off by default
+└── verbclass.py  # git/gh read-or-write classification for run_command logs
 server.py         # Root shim → homelab_ops_mcp.server:main (backward-compat)
-tests/            # pytest suite (~96% coverage)
+tests/            # pytest suite (~98% coverage)
+uv.lock           # Locked dependency set
 ```
 
 All settings come from CLI args (`--host`, `--port`, `--path`) or environment
-variables — no config file. The env vars are `LOG_LEVEL` and `LOG_FILE` for logging,
-and `SYSTEM_OPS_CHILD_ENV_ENFORCE` / `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` for the
-environment handed to `run_command`'s children (see README). Every one has a safe
-in-code default. See `ARCHITECTURE.md` for detail.
+variables — no config file. The README documents every variable: logging
+(`LOG_LEVEL`, `LOG_FILE`), the child environment (`SYSTEM_OPS_CHILD_ENV_ENFORCE`,
+`SYSTEM_OPS_CHILD_ENV_ALLOWLIST`), output and read size (`SYSTEM_OPS_OUTPUT_LIMIT_BYTES`),
+extra accepted `Host` values (`SYSTEM_OPS_ALLOWED_HOSTS`) and telemetry. Every one has a
+safe in-code default. See `ARCHITECTURE.md` for detail.
+
+`write_file` and `edit_file` write through symlinks and refuse hard-linked files;
+`edit_file` changes only the matched bytes and refuses non-UTF-8 files. Requests whose
+`Host` is not a loopback name are refused with 421.
 
 Paths passed to the file tools and to `run_command`'s `cwd` must be absolute. They are
 rejected otherwise — `Path()` does no tilde expansion, so a `~/...` path would resolve
@@ -38,21 +46,26 @@ against the process working directory instead.
 ## Running locally
 
 ```bash
-pip install -e ".[dev]"
-homelab-ops-mcp --host 0.0.0.0 --port 8282 --path /mcp
+uv sync --extra dev
+uv run homelab-ops-mcp --port 8282 --path /mcp      # binds 127.0.0.1
 # or the backward-compatible shim:
-python server.py --host 0.0.0.0 --port 8282 --path /mcp
+uv run python server.py --port 8282 --path /mcp
 ```
+
+Keep the default loopback bind. `--host 0.0.0.0` exposes unauthenticated shell access
+to the network; see README, "Transport".
 
 ## Development
 
 ```bash
-ruff check . && ruff format --check .
-pytest --cov=homelab_ops_mcp --cov-report=term-missing
-pip-audit --strict .
+uv run ruff check . && uv run ruff format --check .
+uv run pytest --cov=homelab_ops_mcp --cov-report=term-missing
 ```
 
-CI (`.github/workflows/ci.yml`) runs these across Python 3.11–3.13.
+CI (`.github/workflows/ci.yml`) runs these across Python 3.11–3.13 from `uv.lock`,
+with and without the `[telemetry]` extra and against the newest allowed versions, and
+audits the locked set. `secret-scan.yml` runs gitleaks. Change a dependency in
+`pyproject.toml` and commit the `uv lock` result with it.
 
 ## Wiring into a Claude config (streamable HTTP)
 

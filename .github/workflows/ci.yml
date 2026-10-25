@@ -4,9 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, Monday 05:41 UTC, so the `latest` job meets a new upstream release
+    # without waiting for a PR. Clear of secret-scan.yml.
+    - cron: "41 5 * * 1"
+
+# Least privilege at the top level. No job below escalates.
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -15,12 +24,131 @@ jobs:
     steps:
       # Actions are pinned to commit SHAs (not floating tags) per repo-standards —
       # a moved tag can't silently swap the action's code out from under CI.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: py
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
-      - run: pytest --cov=homelab_ops_mcp --cov-report=term-missing
-      - run: pip-audit --strict .
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # Without this the SHA-pinned action fetches the latest uv. Move it by hand,
+          # in every job, alongside a `uv lock` refresh.
+          version: "0.13.4"
+      # FROM THE LOCK. `--frozen` installs exactly uv.lock and fails rather than
+      # re-resolve, so a green run is evidence about the set that is deployed.
+      - name: Install dependencies (locked, [dev])
+        env:
+          UV_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: uv sync --frozen --extra dev
+      - run: uv run --frozen --no-sync ruff check .
+      - run: uv run --frozen --no-sync ruff format --check .
+      - run: uv run --frozen --no-sync pytest --cov=homelab_ops_mcp --cov-report=term-missing
+
+  # The [telemetry] extra installed. Without this job the populated paths in
+  # telemetry.py never run in CI, and the missing-dependency tests are only ever
+  # exercised where the dependency really is missing (#911).
+  test-telemetry:
+    name: Test with [telemetry] (Python 3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: py
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.4"
+      - name: Install dependencies (locked, [dev,telemetry])
+        env:
+          UV_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: uv sync --frozen --extra dev --extra telemetry
+      - name: The extra really is installed
+        run: uv run --frozen --no-sync python -c "import opentelemetry.sdk.trace, influxdb_client_3, nats"
+      - run: uv run --frozen --no-sync pytest --cov=homelab_ops_mcp --cov-report=term-missing
+
+  # The newest versions pyproject.toml allows, not the lock. The lock is what
+  # ships, so every other job tests it; this one exists because a pin alone hides a
+  # forward-compatibility break until the day someone re-resolves (#611).
+  #
+  # GATING, deliberately. The ranges are capped below the next major, so anything
+  # that breaks here is a release a fresh install could pick up today. A
+  # continue-on-error job would show a green tick over a red run, which is the
+  # signal this job exists to make visible.
+  latest:
+    name: Test against latest allowed versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: py
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.4"
+      - name: Resolve and install the newest allowed set
+        env:
+          UV_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: |
+          uv lock --upgrade
+          uv sync --frozen --extra dev --extra telemetry
+          uv pip list | grep -iE '^(fastmcp|mcp|starlette|uvicorn) '
+      - run: uv run --frozen --no-sync pytest
+
+  # DEPENDENCY AUDIT, against the lock. `pip-audit .` re-resolves the declared
+  # ranges and reports on what a fresh install would get today, not on what is
+  # pinned and deployed: it passed here while the deployed fastmcp and mcp carried
+  # published advisories.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.4"
+      # A committed lock nobody checks is a stale file that looks like a pin.
+      - name: Lockfile is in sync with pyproject.toml
+        run: uv lock --check
+      # Two sets: a runtime advisory affects the deployed server, a dev advisory only
+      # CI. The telemetry extra is runtime: off by default, but loaded when enabled.
+      # --no-emit-project: --strict trips on the project's own versionless entry.
+      - name: Export runtime and dev dependency sets
+        run: |
+          mkdir -p .audit-runtime .audit-dev
+          uv export --frozen --no-emit-project --all-extras --no-extra dev \
+            --format pylock.toml -o .audit-runtime/pylock.toml
+          uv export --frozen --no-emit-project --extra dev \
+            --format pylock.toml -o .audit-dev/pylock.toml
+      # Separate directories, so `--locked` cannot merge the two. pip-audit is pinned.
+      # No --ignore-vuln without a dated, ticket-referenced reason next to it.
+      - name: Audit runtime dependencies
+        run: uv tool run --from "pip-audit==2.10.1" pip-audit --strict --locked .audit-runtime
+      - name: Audit dev dependencies
+        run: uv tool run --from "pip-audit==2.10.1" pip-audit --strict --locked .audit-dev
+
+  # The wheel must build from src/ and import from outside the tree.
+  build:
+    name: Build and import the wheel
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.4"
+      - name: Build and import from outside the tree
+        run: |
+          uv build --wheel
+          cd /tmp
+          uv venv -q wheel-check
+          uv pip install -q -p wheel-check "$GITHUB_WORKSPACE"/dist/*.whl
+          wheel-check/bin/python -c "import homelab_ops_mcp.server; print('import ok')"
+          test -x wheel-check/bin/homelab-ops-mcp
