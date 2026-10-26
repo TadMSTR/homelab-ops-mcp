@@ -1,5 +1,9 @@
 # homelab-ops-mcp
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![CI](https://github.com/TadMSTR/homelab-ops-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TadMSTR/homelab-ops-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A [FastMCP](https://github.com/jlowin/fastmcp) server that provides shell command execution, file system access, and process inspection over the [MCP Streamable-HTTP transport](https://modelcontextprotocol.io/specification/). Built for homelab operations agents that need to read files, run commands, and inspect processes on the host machine.
 
 ## Security Warning
@@ -42,8 +46,31 @@ spec treats as meaningless when `readOnlyHint` is true.
 Streamable-HTTP on `http://<host>:<port>/mcp` (default `127.0.0.1:8282`).
 
 The bind host defaults to `127.0.0.1` (loopback only). Because this server offers
-**unauthenticated** shell execution and filesystem access, network isolation is the only
+**unauthenticated** shell execution and filesystem access, network isolation is its
 control — keep it loopback-bound unless you have a specific reason to expose it.
+
+### Host and Origin check
+
+Loopback alone does not keep a browser out. A web page whose hostname an attacker points
+at `127.0.0.1` (DNS rebinding) is, to the browser, same-origin with this port. The server
+therefore refuses any request whose `Host` header is not a loopback name, with `421`, and
+any request that carries an `Origin` header at all, with `403`:
+
+| Accepted `Host` | Accepted `Origin` |
+|---|---|
+| `127.0.0.1:*`, `localhost:*`, `[::1]:*` | none: only browsers send `Origin`, and no browser is a client |
+
+Any port is accepted, not only the bind port: a client that reaches the server through a
+port forward (an SSH tunnel, say) sends the forward's local port. MCP clients send no
+`Origin` and are unaffected by that half. Loopback origins are refused too: allowing them
+would trust every web app served on the same host.
+
+If you bind `--host 0.0.0.0`, the clients arrive under another name and are refused until
+you list it:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SYSTEM_OPS_ALLOWED_HOSTS` | _(unset)_ | Comma-separated **exact** extra `Host` values, e.g. `host.docker.internal:8282` |
 
 If an MCP client runs in its own container or network namespace and must reach the server
 across it, bind `--host 0.0.0.0` explicitly — loopback isn't reachable from another
@@ -54,10 +81,14 @@ IP ranges.
 ## Installation
 
 ```bash
-pip install .           # or: pip install -e .   for development
+uv sync --frozen --no-dev --no-editable          # a deployment: exactly the audited uv.lock
+uv sync --frozen --no-dev --no-editable --extra telemetry   # ... with telemetry
+pip install .                                     # ad hoc: re-resolves, so NOT the lock
 ```
 
 This installs the `homelab_ops_mcp` package and a `homelab-ops-mcp` console script.
+CI tests and audits the versions in `uv.lock`; `pip install .` resolves the ranges in
+`pyproject.toml` afresh and can install something CI never saw.
 
 ## Running
 
@@ -132,7 +163,25 @@ first.
 
 The child runs in its own session and is killed by process group, so the whole pipeline
 goes rather than just the `bash` that spawned it. The timeout path gets the same
-treatment — previously a timeout killed `bash` and left its children running.
+treatment, and the timeout bounds the command's exit, not only its output: a command that
+redirects its own stdio (`exec >>"$LOG" 2>&1`) is still killed at the deadline.
+
+Every `run_command` response has the same keys: `stdout`, `stderr`, `exit_code`,
+`truncated`, `execution_time` and `error`. `error` is `null` unless the tool itself failed
+(a refused `cwd`, or a command that could not be started); a non-zero exit code or a
+timeout is the command's outcome and leaves it `null`.
+
+### File tools
+
+| Behaviour | Detail |
+|---|---|
+| Read cap | `read_file` returns at most `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` of content, counted as UTF-8 after decoding; past that `truncated` is `true` and `returned_lines` says where it stopped. The file is streamed and reading stops once the range or the budget is done, so a short range costs a short read; `total_lines` is then `null`, since the rest was not counted. `read_multiple_files` shares one budget across the whole call and counts each distinct path once. |
+| Line ranges | `start_line` below 1 is read as 1. `end_line` below 1, or before `start_line`, is an error. A range starting past the end returns empty content with `returned_lines: "none"`. Lines end at LF, as for `wc -l`. |
+| Byte fidelity | `read_file` returns content as it is on disk, CRLF included. `edit_file` rewrites only the matched span; every other byte is kept. In a CRLF file an `old_str` written with LF breaks is matched against its CRLF form and `new_str` is given CRLF breaks (`line_endings: "crlf"` in the result). A file that is not valid UTF-8 is refused by `edit_file` rather than re-encoded. |
+| Symlinks | `write_file` and `edit_file` write *through* a symlink: the link is kept, its target changes, and `written_to` names the file written. A link that another user planted in a shared sticky directory such as `/tmp`, anywhere in the path, is refused, as the kernel's `protected_symlinks` rule would. With `create_dirs`, a missing directory the link points into is created. |
+| Hard links | A file with more than one hard link is refused by `write_file` and `edit_file`. Their writes are atomic (temp file and rename), and a rename would detach this name from the others. |
+| What `edit_file` reads | Regular files only, up to 16 MiB. A FIFO, device or directory is refused without blocking, and so is a larger file; use `run_command` for those. |
+| No-match hint | When `edit_file` finds no match it quotes the closest passage. That search is skipped for an `old_str` over 2 KiB or a file over 2 MiB, and gives up after one second, so a failed edit always returns promptly. |
 
 ### Child process environment
 
@@ -265,13 +314,18 @@ covers. The handle is opened in append mode, so a `copytruncate`-style rotation 
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-ruff check . && ruff format --check .
-pytest --cov=homelab_ops_mcp --cov-report=term-missing
+uv sync --extra dev            # installs exactly uv.lock
+uv run ruff check . && uv run ruff format --check .
+uv run pytest --cov=homelab_ops_mcp --cov-report=term-missing
 ```
 
+Dependencies are locked in `uv.lock`, and CI installs from it, so a green run says
+something about the versions that are deployed. CI runs the suite across Python 3.11–3.13,
+once more with the `[telemetry]` extra installed, and once against the newest versions
+`pyproject.toml` allows. It audits the locked set, not a fresh resolve.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and [ARCHITECTURE.md](ARCHITECTURE.md)
-for the layout. CI runs the same checks across Python 3.11–3.13.
+for the layout.
 
 ## MCP Client Configuration
 

@@ -22,20 +22,27 @@ and the referenced-variable log carries only names the caller itself wrote into
 the command text. Pinned by test.
 """
 
+import codecs
 import contextlib
 import difflib
+import errno
 import functools
+import logging
 import os
 import re
+import secrets
 import selectors
 import signal
+import stat
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
 import psutil
 from fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
+from starlette.middleware import Middleware
+from starlette.requests import HTTPConnection
 
 from . import telemetry
 from .logging import configure_logging, tame_library_logging
@@ -238,27 +245,201 @@ def _resolve_path(path: str) -> Path:
     return p
 
 
-def _atomic_write(path: Path, content: str) -> int:
-    """Write ``content`` to ``path`` atomically and return the byte count.
+class LinkedFileError(OSError):
+    """Raised when the target has other hard links that a rename would detach."""
 
-    Writes to a temp file in the same directory (so ``os.replace`` stays on one
-    filesystem), then renames over the target — a crash mid-write leaves either
-    the old file or the new one, never a truncated mix. The mode of an existing
-    target is preserved; new files keep the secure 0600 mode from ``mkstemp``.
+
+class UnsafeLinkError(PermissionError):
+    """Raised for a symlink the kernel's ``protected_symlinks`` rule would not follow."""
+
+
+_MAX_LINK_HOPS = 40  # the kernel's own limit (ELOOP)
+
+
+def _link_hop_allowed(link_uid: int, dir_mode: int, dir_uid: int, euid: int) -> bool:
+    """The ``fs.protected_symlinks`` rule, for one link.
+
+    In a sticky, world-writable directory (``/tmp``), a link is followed only if
+    the follower owns it or the link's owner owns the directory. Anyone can
+    plant a link in such a directory, so without this rule a write to
+    ``/tmp/report.txt`` (or ``/tmp/somedir/report.txt``) could be steered into
+    any file the server can write.
     """
-    data = content.encode()
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    shared = dir_mode & stat.S_ISVTX and dir_mode & stat.S_IWOTH
+    return not shared or link_uid in (euid, dir_uid)
+
+
+def _checked_resolve(path: Path) -> Path:
+    """Resolve ``path`` one component at a time, applying the link rule to every link met.
+
+    ``os.path.realpath`` follows links in userspace, so the kernel's
+    ``protected_symlinks`` check never runs on them, and a host may have it off
+    anyway. Every symlink on the way, in a directory component or the final
+    one and at every hop of a chain, is checked here instead. A component that
+    does not exist ends the walk: nothing below it can be a link, so the rest
+    is joined lexically.
+
+    This is a check, not the resolution the write uses. The write then opens
+    the resolved directory through the kernel (``_open_dir``), so a link
+    swapped in after this walk is still subject to the kernel's rule, and the
+    final component is handled relative to that directory without following
+    links.
+    """
+    parts = list(path.parts[1:])
+    resolved = Path("/")
+    hops = 0
+    while parts:
+        name = parts.pop(0)  # Path.parts never yields "" or "."
+        if name == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / name
+        try:
+            st = os.lstat(candidate)
+        except FileNotFoundError:
+            # Nothing below a missing component can be a link, so the rest is
+            # joined as is. A ".." in it is refused, as the kernel would
+            # (ENOENT): collapsing it lexically would climb back into existing
+            # directories this walk never checked, links included.
+            if ".." in parts:
+                raise FileNotFoundError(
+                    errno.ENOENT, "a '..' follows a component that does not exist", str(path)
+                ) from None
+            return candidate.joinpath(*parts)
+        if not stat.S_ISLNK(st.st_mode):
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > _MAX_LINK_HOPS:
+            raise OSError(f"too many levels of symbolic links: {path}")
+        holder = os.stat(resolved)
+        if not _link_hop_allowed(st.st_uid, holder.st_mode, holder.st_uid, os.geteuid()):
+            raise UnsafeLinkError(
+                f"{candidate} is a symlink in a shared sticky directory, owned by neither "
+                "you nor the directory's owner; it was not followed and nothing was written."
+            )
+        target = Path(os.readlink(candidate))
+        if target.is_absolute():
+            resolved = Path("/")
+            parts = list(target.parts[1:]) + parts
+        else:
+            parts = list(target.parts) + parts
+    return resolved
+
+
+def _open_dir(directory: Path, create: bool = False) -> int:
+    """Open ``directory`` through the kernel and return the fd.
+
+    The kernel walks the path itself, so ``protected_symlinks`` applies to any
+    link in it, including one swapped in after ``_checked_resolve`` looked.
+    """
+    if create:
+        os.makedirs(directory, exist_ok=True)
+    return os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+class _Target:
+    """Where a write to a path lands: an open directory fd, a name in it, and its state."""
+
+    def __init__(self, path: Path, create_dirs: bool = False):
+        self.resolved = _checked_resolve(path)
+        self.name = self.resolved.name
+        self.dfd = _open_dir(self.resolved.parent, create_dirs)
+        try:
+            try:
+                self.st = os.stat(self.name, dir_fd=self.dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                self.st = None
+            if self.st is not None and stat.S_ISDIR(self.st.st_mode):
+                raise IsADirectoryError(f"{path} is a directory")
+            if self.st is not None and stat.S_ISREG(self.st.st_mode) and self.st.st_nlink > 1:
+                raise LinkedFileError(
+                    f"{path} has {self.st.st_nlink} hard links; an atomic write would detach "
+                    "this name from the others, so nothing was written. Edit it with "
+                    "run_command (which writes in place) if that is what you want."
+                )
+        except BaseException:
+            os.close(self.dfd)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.dfd)
+        return False
+
+
+def _create_temp(dfd: int, name: str) -> tuple[int, str]:
+    """Create a private temp file beside ``name`` in ``dfd``, never through a link."""
+    while True:
+        tmp = f".{name}.{secrets.token_hex(6)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            return os.open(tmp, flags, 0o600, dir_fd=dfd), tmp
+        except FileExistsError:  # pragma: no cover — 48 random bits colliding
+            continue
+
+
+def _write_into(target: _Target, data: bytes) -> int:
+    """Write ``data`` atomically to ``target``; return the byte count.
+
+    Temp file in the same directory (so the rename stays on one filesystem),
+    then a rename over the name — a crash leaves the old file or the new one,
+    never a truncated mix. The rename replaces the directory entry and never
+    follows a link, so a link planted at the name after the check is replaced,
+    not written through. An existing file's mode is kept; a new file is 0600.
+    """
+    fd, tmp = _create_temp(target.dfd, target.name)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        with contextlib.suppress(OSError):
-            os.chmod(tmp, os.stat(path).st_mode & 0o777)
-        os.replace(tmp, path)
+            if target.st is not None and stat.S_ISREG(target.st.st_mode):
+                os.fchmod(f.fileno(), target.st.st_mode & 0o777)
+        os.replace(tmp, target.name, src_dir_fd=target.dfd, dst_dir_fd=target.dfd)
     except BaseException:
         with contextlib.suppress(OSError):
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=target.dfd)
         raise
     return len(data)
+
+
+# Whole-file reads for edit_file. read_file streams; an edit needs the file in
+# memory, so it is refused past this size rather than allowed to exhaust the
+# process every client shares.
+_EDIT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _read_regular(target: _Target) -> bytes:
+    """Read a regular file named in ``target``: no links followed, no FIFOs, bounded.
+
+    ``O_NONBLOCK`` so a FIFO cannot block the open, ``O_NOFOLLOW`` so a link
+    swapped in since the check is refused rather than followed, and ``fstat`` on
+    what was actually opened decides whether it is a regular file.
+    """
+    limit = _EDIT_MAX_BYTES
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fd = os.open(target.name, flags, dir_fd=target.dfd)
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{target.resolved} is not a regular file")
+        if st.st_size > limit:
+            raise OSError(
+                f"{target.resolved} is {st.st_size} bytes, over edit_file's {limit}-byte "
+                "limit; nothing was changed. Use run_command for a file this size."
+            )
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(f"{target.resolved} grew past edit_file's {limit}-byte limit while read")
+    return data
+
+
+def _written_to(path: Path, target: _Target) -> dict:
+    """``{"written_to": ...}`` when the write landed somewhere other than ``path`` itself."""
+    if target.resolved != Path(os.path.normpath(path)):
+        return {"written_to": str(target.resolved)}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +448,7 @@ def _atomic_write(path: Path, content: str) -> int:
 _OUTPUT_LIMIT_ENV_VAR = "SYSTEM_OPS_OUTPUT_LIMIT_BYTES"
 _DEFAULT_OUTPUT_LIMIT = 1024 * 1024  # 1 MiB per stream
 _READ_CHUNK = 65536
+_REAP_TIMEOUT = 5
 
 
 def _output_limit() -> int:
@@ -338,9 +520,24 @@ def _run_capped(command: str, cwd: str, env: dict, timeout: int, limit: int) -> 
     finally:
         sel.close()
 
+    # Both pipes at EOF does not mean the command has finished: one that
+    # redirects its own stdio (``exec >>"$LOG" 2>&1``) closes them at once and
+    # keeps running. So the deadline also bounds the wait for the exit itself.
+    if not truncated and not timed_out:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
     if truncated or timed_out:
         _kill_group(proc)
-    exit_code = proc.wait()
+    # Bounded even after SIGKILL: a process stuck in uninterruptible sleep (an
+    # NFS stall) cannot be reaped until the kernel lets go of it, and the tool
+    # call must return regardless. Its exit code is then unknown.
+    try:
+        exit_code = proc.wait(timeout=_REAP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.warning("run_command.unreaped", pid=proc.pid)
+        exit_code = -1
     for stream in buffers:
         stream.close()
 
@@ -361,6 +558,31 @@ def _kill_group(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def _command_result(
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    truncated: bool,
+    started: float,
+    error: str | None = None,
+) -> dict:
+    """The one shape every ``run_command`` response has, success or failure.
+
+    ``error`` is set only when the *tool* failed (the cwd was refused, or the
+    command could not be spawned), which is what ``_instrumented`` counts. A
+    non-zero exit or a timeout is the command's outcome, not the tool's, and
+    leaves it None.
+    """
+    return {
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+        "truncated": truncated,
+        "execution_time": round(time.perf_counter() - started, 4),
+        "error": error,
+    }
+
+
 def _mark_truncated(text: str, limit: int) -> str:
     """Append an explicit marker so truncation is distinguishable from brevity."""
     return f"{text}\n[truncated: output reached the {limit}-byte per-stream cap]"
@@ -370,8 +592,8 @@ def _mark_truncated(text: str, limit: int) -> str:
 # camelCase key names, rather than by constructing an mcp.types.ToolAnnotations
 # with snake_case keyword arguments.
 #
-# The two are not interchangeable across versions. In mcp 1.27.1 — the version
-# deployed here — that model's fields are literally named `readOnlyHint`, there
+# The two are not interchangeable across versions. In mcp 1.x (1.27.1 when this
+# was written, 1.30.0 in uv.lock now) that model's fields are literally named `readOnlyHint`, there
 # are no aliases, and it is configured `extra="allow"`. A snake_case keyword
 # does not raise there: it is silently kept as an unrelated extra attribute
 # while the real `readOnlyHint` stays None, so the tool ships with no usable
@@ -413,9 +635,13 @@ def run_command(
     If either reaches the cap the process is killed and ``truncated`` is true,
     so a capped result is distinguishable from a genuinely short one.
 
-    Every response carries ``execution_time``, the wall-clock seconds the
-    command took.
+    Every response carries the same keys: ``stdout``, ``stderr``,
+    ``exit_code``, ``truncated``, ``execution_time`` (wall-clock seconds) and
+    ``error``. ``error`` is null unless the tool itself failed — the cwd was
+    refused or the command could not be started. A non-zero exit code or a
+    timeout leaves it null.
     """
+    started = time.perf_counter()
     working_dir = cwd or str(Path.home())
     # Only the working directory is validated. Tilde paths *inside* ``command``
     # are fine — those go through bash, which expands them correctly.
@@ -423,7 +649,8 @@ def run_command(
         _resolve_path(working_dir)
     except PathValidationError as e:
         log.warning("run_command.invalid_cwd", cwd=working_dir)
-        return {"stdout": "", "stderr": f"cwd: {e}", "exit_code": -1}
+        msg = f"cwd: {e}"
+        return _command_result("", msg, -1, False, started, error=msg)
     # Of the environment itself only the count is logged — never a name, never
     # a value. The separate `at_risk` list holds names the *caller* wrote into
     # the command text, which is caller-authored config rather than a secret.
@@ -444,12 +671,10 @@ def run_command(
     # is bounded cardinality and cannot carry a token pasted onto a command line.
     verb_class = classify_verb(command)
     limit = _output_limit()
-    started = time.perf_counter()
     try:
         stdout, stderr, exit_code, truncated, timed_out = _run_capped(
             command, working_dir, child_env, timeout, limit
         )
-        elapsed = round(time.perf_counter() - started, 4)
         if timed_out:
             log.warning(
                 "run_command.timeout",
@@ -459,13 +684,9 @@ def run_command(
                 env_withheld_count=withheld,
                 env_enforced=enforced,
             )
-            return {
-                "stdout": stdout,
-                "stderr": f"Command timed out after {timeout} seconds.",
-                "exit_code": -1,
-                "truncated": truncated,
-                "execution_time": elapsed,
-            }
+            return _command_result(
+                stdout, f"Command timed out after {timeout} seconds.", -1, truncated, started
+            )
         if truncated:
             if len(stdout.encode(errors="replace")) >= limit:
                 stdout = _mark_truncated(stdout, limit)
@@ -486,13 +707,7 @@ def run_command(
             env_withheld_count=withheld,
             env_enforced=enforced,
         )
-        return {
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
-            "truncated": truncated,
-            "execution_time": elapsed,
-        }
+        return _command_result(stdout, stderr, exit_code, truncated, started)
     except Exception as e:
         log.error(
             "run_command.error",
@@ -502,18 +717,127 @@ def run_command(
             env_withheld_count=withheld,
             env_enforced=enforced,
         )
-        return {
-            "stdout": "",
-            "stderr": str(e),
-            "exit_code": -1,
-            "truncated": False,
-            "execution_time": round(time.perf_counter() - started, 4),
-        }
+        return _command_result("", str(e), -1, False, started, error=str(e))
 
 
 # ---------------------------------------------------------------------------
 # read_file
 # ---------------------------------------------------------------------------
+def _read_lines_capped(path: Path, first: int, last: int | None, limit: int) -> dict:
+    """Stream ``path`` and return lines ``first``..``last`` (1-indexed), at most ``limit`` bytes.
+
+    The file is read in bounded chunks rather than whole, so memory stays at
+    about ``limit`` however large the file is. Reading stops as soon as the
+    range is complete or the budget is spent, so a short range near the start
+    of a huge file costs a short read; ``total_lines`` is then None, because
+    the rest of the file was not counted.
+
+    ``limit`` counts the returned text as UTF-8, after decoding: an invalid
+    byte becomes U+FFFD, three bytes, so counting raw bytes would let a binary
+    file return three times the cap.
+
+    Lines end at LF only, the same as ``wc -l`` and ``sed -n``, and the bytes
+    are returned as they are on disk: a CRLF file reads back with its CRs, so
+    what ``read_file`` shows is what ``edit_file`` will match.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pieces: list[str] = []
+    used = 0
+    truncated = False
+    complete = True
+    returned_first = returned_last = None
+    line_no = 1
+    pending = False  # the current line has bytes but no newline yet
+    with open(path, "rb") as f:
+        while chunk := f.readline(_READ_CHUNK):
+            if truncated or (last is not None and line_no > last):
+                complete = False  # there is more file, and it was not read
+                break
+            if line_no >= first:
+                room = limit - used
+                text = decoder.decode(chunk)
+                encoded = text.encode()
+                if len(encoded) > room:
+                    # Cut on a character boundary, never mid-sequence.
+                    text = encoded[:room].decode(errors="ignore")
+                    encoded = text.encode()
+                    truncated = True
+                pieces.append(text)
+                used += len(encoded)
+                # A line counts as returned only if some of it was: a budget
+                # that runs out on a line boundary, or inside the line's first
+                # character, returns none of it, and a caller resuming at
+                # last + 1 must not skip it.
+                if text:
+                    if returned_first is None:
+                        returned_first = line_no
+                    returned_last = line_no
+            if chunk.endswith(b"\n"):
+                line_no += 1
+                pending = False
+            else:
+                pending = True
+    if not truncated:
+        tail = decoder.decode(b"", final=True)  # a dangling partial sequence
+        if tail and len(tail.encode()) <= limit - used:
+            pieces.append(tail)
+        elif tail:
+            truncated = True  # left out, so say so
+    total = (line_no if pending else line_no - 1) if complete else None
+    return {
+        "content": "".join(pieces),
+        "total_lines": total,
+        "first": returned_first,
+        "last": returned_last,
+        "truncated": truncated,
+    }
+
+
+def _read_file(path: str, start_line: int | None, end_line: int | None, limit: int) -> dict:
+    """``read_file``'s body, with the byte budget passed in (see ``read_multiple_files``)."""
+    try:
+        p = _resolve_path(path)
+        if not p.exists():
+            return {"error": f"File not found: {path}"}
+        if not p.is_file():
+            return {"error": f"Path is not a file: {path}"}
+
+        ranged = start_line is not None or end_line is not None
+        first = max(1, start_line or 1)
+        if end_line is not None and end_line < 1:
+            # 0 and negatives used to mean "whole file" and "slice from the end",
+            # silently. Neither is a line number.
+            return {"error": f"end_line must be at least 1, got {end_line}"}
+        if end_line is not None and end_line < first:
+            return {"error": f"end_line ({end_line}) is before start_line ({first})"}
+
+        r = _read_lines_capped(p, first, end_line, limit)
+        if r["truncated"]:
+            log.warning("read_file.truncated", path=path, limit_bytes=limit)
+        log.info("read_file.done", path=path, total_lines=r["total_lines"], ranged=ranged)
+        result = {
+            "path": path,
+            "total_lines": r["total_lines"],
+            "content": r["content"],
+            "truncated": r["truncated"],
+        }
+        if ranged or r["truncated"]:
+            # "none" when the range starts past the end of the file.
+            result["returned_lines"] = (
+                f"{r['first']}-{r['last']}" if r["first"] is not None else "none"
+            )
+        return result
+    except PathValidationError as e:
+        log.warning("read_file.invalid_path", path=path)
+        return {"error": str(e)}
+    except PermissionError:
+        log.warning("read_file.permission_denied", path=path)
+        return {"error": f"Permission denied: {path}"}
+    except Exception as e:
+        log.error("read_file.error", path=path, error=str(e))
+        return {"error": str(e)}
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def read_file(
@@ -526,43 +850,18 @@ def read_file(
     Args:
         path: Absolute path to the file.
         start_line: First line to return (1-indexed, inclusive). Omit for start of file.
+            Values below 1 are treated as 1.
         end_line: Last line to return (1-indexed, inclusive). Omit for end of file.
+            Must be at least 1 and not less than start_line.
+
+    At most SYSTEM_OPS_OUTPUT_LIMIT_BYTES (default 1 MiB) of content is returned,
+    counted as UTF-8. Past that ``truncated`` is true and ``returned_lines`` says
+    where it stopped; read the rest with a later ``start_line``. Reading stops
+    once the range or the budget is done, and ``total_lines`` is then null
+    (the rest of the file was not counted). Content is returned byte for byte
+    (CRLF stays CRLF); invalid UTF-8 is shown as U+FFFD.
     """
-    try:
-        p = _resolve_path(path)
-        if not p.exists():
-            return {"error": f"File not found: {path}"}
-        if not p.is_file():
-            return {"error": f"Path is not a file: {path}"}
-
-        lines = p.read_text(errors="replace").splitlines(keepends=True)
-        total = len(lines)
-
-        if start_line is not None or end_line is not None:
-            sl = (start_line - 1) if start_line else 0
-            el = end_line if end_line else total
-            sl = max(0, sl)
-            el = min(total, el)
-            selected = lines[sl:el]
-            log.info("read_file.done", path=path, total_lines=total, ranged=True)
-            return {
-                "path": path,
-                "total_lines": total,
-                "returned_lines": f"{sl + 1}-{el}",
-                "content": "".join(selected),
-            }
-
-        log.info("read_file.done", path=path, total_lines=total, ranged=False)
-        return {"path": path, "total_lines": total, "content": "".join(lines)}
-    except PathValidationError as e:
-        log.warning("read_file.invalid_path", path=path)
-        return {"error": str(e)}
-    except PermissionError:
-        log.warning("read_file.permission_denied", path=path)
-        return {"error": f"Permission denied: {path}"}
-    except Exception as e:
-        log.error("read_file.error", path=path, error=str(e))
-        return {"error": str(e)}
+    return _read_file(path, start_line, end_line, _output_limit())
 
 
 # ---------------------------------------------------------------------------
@@ -576,15 +875,31 @@ def read_multiple_files(paths: list[str]) -> dict:
     One failing path does not fail the others — each entry is either a file
     result or an ``error``, so a partial read is still useful.
 
+    The whole call shares one SYSTEM_OPS_OUTPUT_LIMIT_BYTES budget (default
+    1 MiB), so asking for more files does not multiply what is returned. Once
+    it is spent, the remaining paths are not read and their entries say so.
+
     Args:
         paths: Absolute paths to read.
     """
     results = {}
+    budget = _output_limit()
     for path in paths:
-        results[path] = read_file(path)
+        if path in results:
+            continue
+        if budget <= 0:
+            results[path] = {
+                "error": "Not read: earlier files used up this call's output budget. "
+                "Read it in a separate call."
+            }
+            continue
+        results[path] = _read_file(path, None, None, budget)
+        budget -= len(results[path].get("content", "").encode(errors="replace"))
+    # Counted over the distinct paths actually reported: a repeated path is
+    # read once, and counting it twice made a phantom failure with no entry.
     ok = sum(1 for r in results.values() if "error" not in r)
-    log.info("read_multiple_files.done", count=len(paths), ok=ok)
-    return {"count": len(paths), "ok": ok, "failed": len(paths) - ok, "files": results}
+    log.info("read_multiple_files.done", count=len(results), ok=ok)
+    return {"count": len(results), "ok": ok, "failed": len(results) - ok, "files": results}
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +922,13 @@ def write_file(
 ) -> dict:
     """Write (overwrite) a file at the given path.
 
+    The write is atomic (temp file + rename). If ``path`` is a symlink the write
+    goes through it to the real file, the link is kept, and ``written_to`` names
+    the file written. A file with more than one hard link is refused, since a
+    rename would detach this name from the others. So is a path through a
+    symlink that another user planted in a shared sticky directory such as
+    /tmp, the case the kernel's protected_symlinks rule exists for.
+
     Args:
         path: Absolute path to the file.
         content: Full content to write. Replaces any existing content.
@@ -614,13 +936,17 @@ def write_file(
     """
     try:
         p = _resolve_path(path)
-        if create_dirs:
-            p.parent.mkdir(parents=True, exist_ok=True)
-        written = _atomic_write(p, content)
-        log.info("write_file.done", path=path, bytes_written=written)
-        return {"path": path, "bytes_written": written}
+        # create_dirs applies to the directory the write lands in, so a link to
+        # a file in a directory that does not exist yet gets that directory.
+        with _Target(p, create_dirs=create_dirs) as target:
+            written = _write_into(target, content.encode())
+            log.info("write_file.done", path=path, bytes_written=written)
+            return {"path": path, "bytes_written": written, **_written_to(p, target)}
     except PathValidationError as e:
         log.warning("write_file.invalid_path", path=path)
+        return {"error": str(e)}
+    except UnsafeLinkError as e:
+        log.warning("write_file.unsafe_link_refused", path=path)
         return {"error": str(e)}
     except PermissionError:
         log.warning("write_file.permission_denied", path=path)
@@ -636,6 +962,16 @@ def write_file(
 # Searching every window of a very large file is not worth the wall time, and
 # the caller is better served by a fast "not found" than a slow near-miss.
 _CLOSEST_MATCH_MAX_BYTES = 2 * 1024 * 1024
+# Bounds on the hint's work. Each window costs a difflib ratio(), roughly
+# quadratic in len(old_str) and pure Python, so it holds the GIL and slows every
+# other agent's call while it runs. Measured before these bounds: 11 s for a
+# 1 KiB old_str against a 35 KiB file, 168 s for 2 KiB against 80 KiB. The
+# budget is checked between windows, so the length cap is what bounds a single
+# comparison (one ratio() at 4 KiB against a 12 KiB window measured ~3 s, so
+# the cap is 2 KiB). A scan that runs out of budget offers no hint rather than
+# a partial one.
+_CLOSEST_MATCH_MAX_OLD = 2048
+_CLOSEST_MATCH_BUDGET_S = 1.0
 # Below this similarity the "closest" window is noise and quoting it misleads.
 _CLOSEST_MATCH_MIN_RATIO = 0.5
 _DIFF_MAX_LINES = 40
@@ -649,11 +985,13 @@ def _closest_match(content: str, old_str: str) -> dict | None:
     give up on editing and rewrite the whole file — which is a much larger and
     riskier write than the edit it was trying to make.
 
-    Returns None when the file is too large to scan or nothing resembles
-    ``old_str`` closely enough to be worth quoting.
+    Returns None when the file or ``old_str`` is too large to scan, the scan
+    runs out of its time budget, or nothing resembles ``old_str`` closely enough
+    to be worth quoting.
     """
-    if len(content) > _CLOSEST_MATCH_MAX_BYTES:
+    if len(content) > _CLOSEST_MATCH_MAX_BYTES or len(old_str) > _CLOSEST_MATCH_MAX_OLD:
         return None
+    deadline = time.monotonic() + _CLOSEST_MATCH_BUDGET_S
 
     lines = content.splitlines(keepends=True)
     old_lines = old_str.splitlines(keepends=True) or [""]
@@ -664,8 +1002,16 @@ def _closest_match(content: str, old_str: str) -> dict | None:
     matcher = difflib.SequenceMatcher(autojunk=False)
     matcher.set_seq1(old_str)
     best_ratio, best_index, best_text = 0.0, 0, ""
+    # ratio() is 2*M/(len(a)+len(b)) with M <= len(a), so a window more than
+    # three times old_str's length scores below 0.5 and can never be quoted.
+    # Skipping it before set_seq2 keeps one huge line from costing anything.
+    max_window = 3 * max(1, len(old_str))
     for i in range(max(1, len(lines) - span + 1)):
+        if time.monotonic() > deadline:
+            return None
         window = "".join(lines[i : i + span])
+        if len(window) > max_window:
+            continue
         matcher.set_seq2(window)
         # quick_ratio is an upper bound, so a window that cannot beat the
         # current best is skipped without the quadratic comparison.
@@ -718,6 +1064,14 @@ def edit_file(
     When no match is found, the result carries the closest passage in the file,
     its line number, and a diff against what was asked for.
 
+    Only the matched span changes; every other byte, line endings included, is
+    written back as it was. In a CRLF file, an old_str written with plain LF
+    line breaks is matched against the CRLF form, and new_str is given CRLF
+    breaks to match (``line_endings`` is then "crlf"). A file that is not valid
+    UTF-8 is refused rather than re-encoded, as is anything that is not a
+    regular file or is over 16 MiB. Symlinks and hard links are handled as in
+    write_file.
+
     Args:
         path: Absolute path to the file.
         old_str: Exact string to find (must match exactly once).
@@ -726,47 +1080,88 @@ def edit_file(
     """
     try:
         p = _resolve_path(path)
-        if not p.exists():
-            return {"error": f"File not found: {path}"}
-
-        original = p.read_text(errors="replace")
-        count = original.count(old_str)
-
-        if count == 0:
-            result = {"error": "old_str not found in file. No changes made."}
-            hint = _closest_match(original, old_str)
-            if hint:
-                result.update(hint)
-            log.info("edit_file.no_match", path=path, had_hint=bool(hint))
-            return result
-        if count > 1:
-            return {
-                "error": f"old_str matched {count} times. Must match exactly once. No changes made."
-            }
-
-        updated = original.replace(old_str, new_str, 1)
-        if dry_run:
-            log.info("edit_file.dry_run", path=path, matches_replaced=1)
-            return {
-                "path": path,
-                "status": "ok",
-                "matches_replaced": 1,
-                "dry_run": True,
-                "bytes_before": len(original.encode()),
-                "bytes_after": len(updated.encode()),
-            }
-        _atomic_write(p, updated)
-        log.info("edit_file.done", path=path, matches_replaced=1)
-        return {"path": path, "status": "ok", "matches_replaced": 1, "dry_run": False}
+        with _Target(p) as target:
+            if target.st is None:
+                return {"error": f"File not found: {path}"}
+            return _edit(p, target, old_str, new_str, dry_run)
     except PathValidationError as e:
         log.warning("edit_file.invalid_path", path=path)
+        return {"error": str(e)}
+    except UnsafeLinkError as e:
+        log.warning("edit_file.unsafe_link_refused", path=path)
         return {"error": str(e)}
     except PermissionError:
         log.warning("edit_file.permission_denied", path=path)
         return {"error": f"Permission denied: {path}"}
+    except FileNotFoundError:
+        return {"error": f"File not found: {path}"}
     except Exception as e:
         log.error("edit_file.error", path=path, error=str(e))
         return {"error": str(e)}
+
+
+def _edit(p: Path, target: _Target, old_str: str, new_str: str, dry_run: bool) -> dict:
+    """``edit_file``'s body, against a target already resolved and checked."""
+    path = str(p)
+    raw = _read_regular(target)
+    try:
+        # Strict, and without newline translation: the file is rewritten from
+        # this string, so any lossy step here would change bytes the edit
+        # never touched.
+        original = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        log.info("edit_file.not_utf8", path=path)
+        return {
+            "error": f"File is not valid UTF-8 (byte {e.start}); edit_file would have "
+            "to re-encode it, so no changes were made. Use run_command for this file."
+        }
+    count = original.count(old_str)
+    crlf = False
+    if count == 0 and "\r\n" in original and "\n" in old_str and "\r" not in old_str:
+        crlf_old = old_str.replace("\n", "\r\n")
+        crlf_count = original.count(crlf_old)
+        if crlf_count:
+            old_str, count, crlf = crlf_old, crlf_count, True
+            if "\r" not in new_str:
+                new_str = new_str.replace("\n", "\r\n")
+
+    if count == 0:
+        result = {"error": "old_str not found in file. No changes made."}
+        hint = _closest_match(original, old_str)
+        if hint:
+            result.update(hint)
+        log.info("edit_file.no_match", path=path, had_hint=bool(hint))
+        return result
+    if count > 1:
+        return {
+            "error": f"old_str matched {count} times. Must match exactly once. No changes made."
+        }
+
+    updated = original.replace(old_str, new_str, 1)
+    extra = {"line_endings": "crlf"} if crlf else {}
+    if dry_run:
+        # The target was resolved and checked already, so a hard-linked file
+        # or an unsafe link fails the dry run the same way as the real one.
+        log.info("edit_file.dry_run", path=path, matches_replaced=1)
+        return {
+            "path": path,
+            "status": "ok",
+            "matches_replaced": 1,
+            "dry_run": True,
+            "bytes_before": len(raw),
+            "bytes_after": len(updated.encode()),
+            **extra,
+        }
+    _write_into(target, updated.encode())
+    log.info("edit_file.done", path=path, matches_replaced=1)
+    return {
+        "path": path,
+        "status": "ok",
+        "matches_replaced": 1,
+        "dry_run": False,
+        **extra,
+        **_written_to(p, target),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +1267,93 @@ def list_processes(
 
 
 # ---------------------------------------------------------------------------
+# Host / Origin check (DNS-rebinding protection)
+# ---------------------------------------------------------------------------
+# The server is unauthenticated, and its control is that only local processes
+# can reach the loopback port. A browser on this host breaks that: a page whose
+# hostname an attacker re-points at 127.0.0.1 is, to the browser, same-origin
+# with this port, and could drive run_command. The browser still sends the
+# attacker's hostname in Host, so refusing any Host that is not a loopback name
+# closes it.
+#
+# Any port, not just the bind port. A client that arrives through a port
+# forward sends the forward's local port: an SSH tunnel from 127.0.0.1:8290 to a
+# remote instance bound to 8282 makes that instance receive
+# `Host: 127.0.0.1:8290`. The port adds nothing against rebinding; the hostname
+# is what an attacker controls.
+#
+# mcp ships this check (TransportSecurityMiddleware), but FastMCP constructs the
+# transport with it switched off. FastMCP 3.4 added a guard of its own, which is
+# also off by default (``http_host_origin_protection = False``) and absent from
+# 3.3. So mcp's check is reused here, explicitly, as a Starlette middleware
+# through mcp.run(middleware=...): it does not depend on a FastMCP setting, and
+# tests/test_host_origin.py pins it against the real app.
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+_ALLOWED_HOSTS_ENV_VAR = "SYSTEM_OPS_ALLOWED_HOSTS"
+
+
+def _transport_security_settings() -> TransportSecuritySettings:
+    """Loopback names on any port, plus exact Host values from ``SYSTEM_OPS_ALLOWED_HOSTS``.
+
+    The extra entries exist for ``--host 0.0.0.0`` deployments, whose clients
+    arrive under another name (``host.docker.internal:8282``, say).
+
+    No Origin is allowed at all. No browser is a legitimate client, and only
+    browsers send Origin, so a request carrying one is refused (403) whatever
+    it names. Allowing loopback origins would have trusted every web app
+    served on this host. A request without the header, which is every MCP
+    client, passes mcp's check.
+    """
+    hosts = [f"{name}:*" for name in _LOOPBACK_NAMES]
+    for entry in os.environ.get(_ALLOWED_HOSTS_ENV_VAR, "").split(","):
+        if entry.strip():
+            hosts.append(entry.strip())
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=[],
+    )
+
+
+class HostOriginGuard:
+    """ASGI middleware: refuse an HTTP request whose Host or Origin is not allowed.
+
+    Refused with 421 (Host) or 403 (Origin), by mcp's own check. The header
+    values are not logged: they are caller-controlled and unbounded.
+    """
+
+    def __init__(self, app, settings: TransportSecuritySettings):
+        self.app = app
+        self.check = TransportSecurityMiddleware(settings)
+        # mcp's check logs each refusal as f"Invalid Host header: {host}", the
+        # raw caller-supplied value. The refusal is logged above without it.
+        logging.getLogger("mcp.server.transport_security").setLevel(logging.ERROR)
+
+    async def __call__(self, scope, receive, send):
+        # WebSocket too: no route takes one today, and a later one must not
+        # arrive unguarded.
+        if scope["type"] in ("http", "websocket"):
+            # is_post=False: Content-Type is checked by the MCP transport itself.
+            # Only the headers are read, so an HTTPConnection serves both types.
+            refusal = await self.check.validate_request(HTTPConnection(scope), is_post=False)
+            if refusal is not None:
+                log.warning(
+                    "http.request_refused", status=refusal.status_code, scope_type=scope["type"]
+                )
+                if scope["type"] == "websocket":
+                    # Closing before accept makes the server answer the upgrade with 403.
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    await refusal(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _http_middleware() -> list[Middleware]:
+    return [Middleware(HostOriginGuard, settings=_transport_security_settings())]
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -894,9 +1376,26 @@ def main() -> None:
 
     tame_library_logging()
     telemetry.init()
-    log.info("server.start", host=args.host, port=args.port, path=args.path)
-    mcp.run(  # pragma: no cover
+    middleware = _http_middleware()
+    log.info(
+        "server.start",
+        host=args.host,
+        port=args.port,
+        path=args.path,
+        allowed_hosts=middleware[0].kwargs["settings"].allowed_hosts,
+    )
+    try:
+        _serve(args, middleware)
+    finally:
+        # Drain the InfluxDB/NATS sinks: without this, metrics still queued when
+        # the process is stopped are dropped. (The OTLP SDK flushes itself at exit.)
+        telemetry.shutdown()
+
+
+def _serve(args, middleware: list[Middleware]) -> None:
+    mcp.run(
         transport="streamable-http",
+        middleware=middleware,
         # 18 lines of ASCII-art banner per start, on a headless service whose
         # log is read with grep.
         show_banner=False,

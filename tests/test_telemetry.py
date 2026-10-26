@@ -1,17 +1,22 @@
 """Telemetry: off by default, never fatal, and correct about what failed.
 
-CI installs only the [dev] extra, so none of the optional backends are present
-here. That is the important case to pin: the module must import and every entry
-point must degrade to a no-op rather than raising.
+The missing-dependency cases SIMULATE the absence of the [telemetry] extra
+rather than relying on it (#911). They used to pass only because CI installs
+[dev] alone, so they proved nothing there and failed in any venv that had the
+extra. ``no_telemetry_extra`` puts ``None`` in ``sys.modules`` for every module
+the fallbacks guard, which makes each import raise ImportError whatever is
+installed. CI runs this file in both a [dev] and a [dev,telemetry] venv.
 """
 
 import contextlib
+import sys
 import threading
 
 import pytest
 
 from homelab_ops_mcp import telemetry
 from homelab_ops_mcp.server import read_file, run_command, write_file
+from tests.conftest import LogRecorder
 
 ALL_VARS = (
     "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -33,21 +38,48 @@ def clean_telemetry(monkeypatch):
     telemetry.reset_for_tests()
 
 
-# --- off by default -----------------------------------------------------------
-def test_optional_backends_are_absent_here():
-    """Guards the premise of this file: these tests would prove nothing otherwise.
+# Every module a fallback in telemetry.py guards. ``opentelemetry`` itself is
+# absent from the list on purpose: ``opentelemetry-api`` arrives transitively via
+# fastmcp, so it is importable in every venv. What the [telemetry] extra adds is
+# the SDK and the exporters. Each module is listed by its full name, because an
+# entry already in ``sys.modules`` is returned without its parent being consulted:
+# blocking only ``opentelemetry.sdk`` would not block a cached
+# ``opentelemetry.sdk.trace``.
+_EXTRA_MODULES = (
+    "opentelemetry.exporter.otlp.proto.grpc.metric_exporter",
+    "opentelemetry.exporter.otlp.proto.grpc.trace_exporter",
+    "opentelemetry.sdk.metrics",
+    "opentelemetry.sdk.metrics.export",
+    "opentelemetry.sdk.resources",
+    "opentelemetry.sdk.trace",
+    "opentelemetry.sdk.trace.export",
+    "influxdb_client_3",
+    "nats",
+)
 
-    Note ``opentelemetry`` itself IS importable — ``opentelemetry-api`` arrives
-    transitively via fastmcp. What the [telemetry] extra adds, and what
-    _init_otlp actually imports, is the SDK and the OTLP exporter. Asserting on
-    the bare namespace package would test the wrong thing.
+
+@pytest.fixture()
+def no_telemetry_extra(monkeypatch):
+    """Make every [telemetry] import fail, whether or not the extra is installed."""
+    for mod in _EXTRA_MODULES:
+        monkeypatch.setitem(sys.modules, mod, None)
+
+
+@pytest.fixture()
+def tlog(monkeypatch):
+    r = LogRecorder()
+    monkeypatch.setattr(telemetry, "log", r)
+    return r
+
+
+# --- off by default -----------------------------------------------------------
+def test_simulated_absence_blocks_every_guarded_import(no_telemetry_extra):
+    """Guards the premise of the missing-dependency tests below.
+
+    Formerly ``test_optional_backends_are_absent_here``, which asserted that the
+    environment lacked the extra. That is a fact about the venv, not the code.
     """
-    for mod in (
-        "opentelemetry.sdk.trace",
-        "opentelemetry.exporter.otlp.proto.grpc.trace_exporter",
-        "influxdb_client_3",
-        "nats",
-    ):
+    for mod in _EXTRA_MODULES:
         with pytest.raises(ImportError):
             __import__(mod)
 
@@ -87,28 +119,36 @@ def test_service_name_overridden_by_env(monkeypatch):
 
 
 # --- missing optional dependency is survivable --------------------------------
-def test_otlp_endpoint_set_but_sdk_missing(monkeypatch):
+# Each test asserts the import-failure warning as well as the end state, so it
+# can only pass by taking the ``except ImportError`` branch it is named for.
+def test_otlp_endpoint_set_but_sdk_missing(monkeypatch, no_telemetry_extra, tlog):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
     telemetry.init()  # must not raise
     assert telemetry._tracer is None
+    assert telemetry._calls_counter is None
+    assert len(tlog.of("otlp_import_failed")) == 1
 
 
-def test_influx_url_set_but_client_missing(monkeypatch):
+def test_influx_url_set_but_client_missing(monkeypatch, no_telemetry_extra, tlog):
     monkeypatch.setenv("SYSTEM_OPS_INFLUXDB3_URL", "http://127.0.0.1:8181")
     telemetry.init()
     assert telemetry._influx_client is None
+    assert len(tlog.of("influxdb3_import_failed")) == 1
 
 
-def test_nats_url_set_but_client_missing(monkeypatch):
+def test_nats_url_set_but_client_missing(monkeypatch, no_telemetry_extra, tlog):
     monkeypatch.setenv("SYSTEM_OPS_NATS_URL", "nats://127.0.0.1:4222")
     telemetry.init()
-    # Publishing is scheduled on the sink loop and swallowed there.
+    # Publishing is scheduled on the sink loop and swallowed there; shutdown
+    # drains the loop, so the warning has been logged by the time it returns.
     with telemetry.record_tool_call("read_file"):
         pass
     telemetry.shutdown()
+    assert telemetry._nats_conn is None
+    assert len(tlog.of("nats_import_failed")) == 1
 
 
-def test_a_missing_backend_does_not_break_the_tool(monkeypatch, tmp_path):
+def test_a_missing_backend_does_not_break_the_tool(monkeypatch, tmp_path, no_telemetry_extra):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
     monkeypatch.setenv("SYSTEM_OPS_INFLUXDB3_URL", "http://127.0.0.1:8181")
     monkeypatch.setenv("SYSTEM_OPS_NATS_URL", "nats://127.0.0.1:4222")
@@ -182,6 +222,12 @@ def test_nonzero_exit_code_is_not_a_tool_error(calls):
     """The command failed; the tool worked."""
     assert run_command("exit 3")["exit_code"] == 3
     assert calls == [("run_command", None)]
+
+
+def test_a_refused_cwd_counts_as_an_error(calls):
+    """run_command's own failures used to return no ``error`` key and count as ok."""
+    run_command("true", cwd="relative")
+    assert calls == [("run_command", "tool_error")]
 
 
 def test_every_tool_is_instrumented(calls, tmp_path):

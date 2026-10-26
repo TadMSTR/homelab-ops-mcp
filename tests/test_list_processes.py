@@ -13,8 +13,9 @@ def test_returns_processes():
 
 def test_limit_applied():
     r = list_processes(limit=3)
-    assert r["count"] <= 3
-    assert len(r["processes"]) <= 3
+    # Any host running this suite has more than three processes.
+    assert r["count"] == 3
+    assert len(r["processes"]) == 3
 
 
 def test_sort_by_pid_ascending():
@@ -39,4 +40,7 @@ def test_unknown_sort_falls_back_to_cpu():
 def test_name_filter():
     # The test runner itself is a python process; filter should match it.
     r = list_processes(name_filter="python", limit=100)
+    # Non-empty first: all() over an empty list is True, so a filter that
+    # dropped everything would otherwise pass.
+    assert r["processes"]
     assert all("python" in (p["name"] or "").lower() for p in r["processes"])

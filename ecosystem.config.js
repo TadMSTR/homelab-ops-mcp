@@ -11,10 +11,14 @@ module.exports = {
 
       // Declared explicitly, and deliberately minimal.
       //
-      // The server reads four variables, all with safe in-code defaults:
-      // LOG_LEVEL (INFO), LOG_FILE (stderr), SYSTEM_OPS_CHILD_ENV_ENFORCE
-      // (false) and SYSTEM_OPS_CHILD_ENV_ALLOWLIST (empty). Host and port are
-      // passed as `args` above, not through the environment.
+      // Every variable the server reads has a safe in-code default, so only the
+      // ones set differently here are declared. The full list is in the README:
+      // LOG_LEVEL, LOG_FILE, SYSTEM_OPS_CHILD_ENV_ENFORCE,
+      // SYSTEM_OPS_CHILD_ENV_ALLOWLIST, SYSTEM_OPS_OUTPUT_LIMIT_BYTES,
+      // SYSTEM_OPS_ALLOWED_HOSTS and the telemetry endpoints. Host and port are
+      // passed as `args` above, not through the environment. With the default
+      // loopback bind, SYSTEM_OPS_ALLOWED_HOSTS stays unset: loopback Host names
+      // are accepted on any port without it.
       //
       // SYSTEM_OPS_CHILD_ENV_ENFORCE is pinned to "false" rather than left
       // unset even though false is the in-code default. `pm2 restart
@@ -24,14 +28,12 @@ module.exports = {
       // from a shell that does not have it set. Declaring it now is what makes
       // the rollback a one-line edit later.
       //
-      // Worth spelling out because the running process carries far more
-      // environment than this block declares — a large inherited bundle plus a
-      // stray API token, none of which the server reads. That is a side effect
-      // of having been started by hand from an interactive shell, which freezes
-      // the whole shell environment into PM2's dump. It is not configuration,
-      // and reproducing it would be actively harmful: it would put credentials
-      // into a process that ignores them, and PM2 would write them straight
-      // back out at the next `pm2 save`.
+      // A process started by hand from an interactive shell carries far more
+      // environment than this block declares, because PM2 freezes the whole
+      // shell environment into its dump. That is not configuration, and
+      // reproducing it here would be harmful: it would put whatever that shell
+      // had sourced into a process that does not read it, and PM2 would write
+      // it straight back out at the next `pm2 save`.
       //
       // Note this does not scrub inheritance: PM2 always passes the parent
       // environment through, so a `pm2 start` from an interactive shell still

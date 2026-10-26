@@ -20,41 +20,43 @@ def _raise(exc):
 
 
 # --- read_file ---------------------------------------------------------------
+# read_file streams the file through _read_lines_capped; fail there.
 def test_read_file_permission_denied(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(PermissionError()))
+    monkeypatch.setattr(server, "_read_lines_capped", _raise(PermissionError()))
     r = read_file(str(sample_file))
     assert "permission denied" in r["error"].lower()
 
 
 def test_read_file_generic_error(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(ValueError("boom")))
+    monkeypatch.setattr(server, "_read_lines_capped", _raise(ValueError("boom")))
     r = read_file(str(sample_file))
     assert r["error"] == "boom"
 
 
 # --- write_file --------------------------------------------------------------
 def test_write_file_permission_denied(monkeypatch, tmp_path):
-    # write_file now writes atomically via tempfile.mkstemp; fail there.
-    monkeypatch.setattr(server.tempfile, "mkstemp", _raise(PermissionError()))
+    # write_file writes atomically via a temp file it creates in the target dir; fail there.
+    monkeypatch.setattr(server, "_create_temp", _raise(PermissionError()))
     r = write_file(str(tmp_path / "x.txt"), "data")
     assert "permission denied" in r["error"].lower()
 
 
 def test_write_file_generic_error(monkeypatch, tmp_path):
-    monkeypatch.setattr(server.tempfile, "mkstemp", _raise(ValueError("nope")))
+    monkeypatch.setattr(server, "_create_temp", _raise(ValueError("nope")))
     r = write_file(str(tmp_path / "x.txt"), "data")
     assert r["error"] == "nope"
 
 
 # --- edit_file ---------------------------------------------------------------
+# edit_file reads raw bytes through _read_regular, so the round-trip is lossless; fail there.
 def test_edit_file_permission_denied(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(PermissionError()))
+    monkeypatch.setattr(server, "_read_regular", _raise(PermissionError()))
     r = edit_file(str(sample_file), "line1", "X")
     assert "permission denied" in r["error"].lower()
 
 
 def test_edit_file_generic_error(monkeypatch, sample_file):
-    monkeypatch.setattr(server.Path, "read_text", _raise(RuntimeError("kaboom")))
+    monkeypatch.setattr(server, "_read_regular", _raise(RuntimeError("kaboom")))
     r = edit_file(str(sample_file), "line1", "X")
     assert r["error"] == "kaboom"
 

@@ -5,13 +5,18 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-*/
 venv/
 .env
 *.env
-core.*
+core.[0-9]*
 *.core
 .coverage
 htmlcov/
 .pytest_cache/
 .ruff_cache/
 *.log
+
+# Key material never belongs in this public repo.
+*.key
+*.pem

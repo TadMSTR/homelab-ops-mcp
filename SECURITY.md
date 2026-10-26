@@ -13,19 +13,32 @@ Include as much detail as possible: the affected component, steps to reproduce, 
 
 ## Scope
 
+This server's purpose is unauthenticated shell execution and filesystem access for
+whatever can reach it. A client that can connect running commands or reading files is
+the design, not a vulnerability. Its controls are the ones below, and a way around any
+of them is in scope.
+
 **In scope:**
 
-- SSRF via service endpoint URLs in the configuration
-- Command or query injection via tool arguments passed to underlying homelab services
-- Information disclosure through tool responses exposing infrastructure topology or credentials
-- Dependency vulnerabilities with a plausible exploitation path in homelab-ops-mcp's usage
+- Reaching the server from beyond its intended boundary: a bypass of the loopback bind
+  default, or of the `Host`/`Origin` check (DNS rebinding from a browser on the host)
+- Path validation bypasses that make a file tool or `run_command`'s `cwd` act on a path
+  other than the absolute path given
+- Secrets or environment values reaching the log at `INFO` or above, or reaching
+  telemetry (the child-environment logging is designed to record counts and
+  caller-written names only)
+- Tool arguments that exhaust the shared server process (memory, CPU, or a call that
+  never returns) despite the documented bounds
+- Dependency vulnerabilities with a plausible exploitation path in this server's usage
 
 **Out of scope:**
 
-- Vulnerabilities in the host system, underlying services, or MCP transport layer
-- Issues that require attacker control of configuration environment variables
+- Anything a connected client can do through the tools as documented
+- Deployments that bind to a non-loopback address on an untrusted network, or list
+  untrusted names in `SYSTEM_OPS_ALLOWED_HOSTS`
+- Issues that require control of the server's own environment variables or command line
   (operator-controlled trust boundaries, not input attack surfaces)
-- Theoretical weaknesses without a realistic attack path against the MCP tool surface
+- Vulnerabilities in the host system or in the MCP SDK itself (report those upstream)
 
 ## Response Expectations
 
