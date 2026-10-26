@@ -69,7 +69,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 source = ["homelab_ops_mcp"]
 
 [tool.coverage.report]
-# Measured 2026-10-25 (v0.5.0 branch, after audit remediation): 98.57% total
+# Measured 2026-10-25 (v0.5.0 branch, after audit remediation): 98.58% total
 # (server.py 100%), identical on Python 3.11, 3.12 and 3.13 and with or without
 # the [telemetry] extra.
 # The floor sits about 4 points under that: high enough that losing a module's

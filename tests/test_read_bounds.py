@@ -197,3 +197,24 @@ def test_truncated_utf8_sequence_at_end_of_file(tmp_path):
     p = tmp_path / "f"
     p.write_bytes(b"ok\xe2\x82")  # the first two bytes of a three-byte character
     assert read_file(str(p))["content"] == "ok�"
+
+
+def test_a_line_none_of_which_fit_is_not_reported_returned(tmp_path, monkeypatch):
+    """R2-02: the budget ran out inside line 2's first character."""
+    monkeypatch.setenv(_OUTPUT_LIMIT_ENV_VAR, "4")
+    p = tmp_path / "f"
+    p.write_bytes("ab\n€x\n".encode())
+    r = read_file(str(p))
+    assert r["content"] == "ab\n"
+    assert r["returned_lines"] == "1-1"
+    assert r["truncated"] is True
+
+
+def test_a_dropped_tail_sets_truncated(tmp_path, monkeypatch):
+    """R2-02: the final U+FFFD did not fit, and was dropped silently."""
+    monkeypatch.setenv(_OUTPUT_LIMIT_ENV_VAR, "3")
+    p = tmp_path / "f"
+    p.write_bytes(b"abc\xe2\x82")
+    r = read_file(str(p))
+    assert r["content"] == "abc"
+    assert r["truncated"] is True

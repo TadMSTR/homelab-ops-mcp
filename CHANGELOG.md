@@ -84,7 +84,7 @@ Behaviour changes worth reading before upgrading:
   pinned) on pushes to main and PRs, and weekly over full history. It first proves the
   gate fires on a planted secret (`tests/check_gitleaks_gate.py`).
 - **Dependabot** maintains `uv.lock` and the action pins.
-- **Coverage floor raised from 80% to 94%**, against a measured 98.57%.
+- **Coverage floor raised from 80% to 94%**, against a measured 98.58%.
 - README badges; `*.key` / `*.pem` ignored; SECURITY.md scope rewritten for what this
   server is; ARCHITECTURE.md, AGENTS.md and CONTRIBUTING.md brought up to date.
 

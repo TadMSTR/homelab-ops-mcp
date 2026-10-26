@@ -471,3 +471,29 @@ def test_edit_refuses_a_file_that_grows_past_the_limit_while_read(monkeypatch):
     monkeypatch.setattr(server, "_EDIT_MAX_BYTES", 10)
     r = edit_file("/proc/self/status", "Name", "x")
     assert "grew past" in r["error"]
+
+
+def test_dot_dot_after_a_missing_component_is_refused(monkeypatch, tmp_path, sticky):
+    """R2-01: /tmp/<missing>/../<foreign-link>/x used to collapse past the check.
+
+    The kernel answers ENOENT for <missing>/.., so that is the answer here too.
+    """
+    victim_dir = tmp_path / "dot_ssh"
+    victim_dir.mkdir()
+    victim = victim_dir / "keys"
+    victim.write_text("original\n")
+    planted = sticky / "dirlink"
+    planted.symlink_to(victim_dir)
+    _as_foreign_link(monkeypatch, planted)
+    sneaky = f"{sticky}/missing/../dirlink/keys"
+    assert "error" in write_file(sneaky, "attacker\n")
+    assert "error" in write_file(sneaky, "attacker\n", create_dirs=True)
+    assert edit_file(sneaky, "original", "attacker")["error"].startswith("File not found")
+    assert victim.read_text() == "original\n"
+    assert not (sticky / "missing").exists()
+
+
+def test_missing_components_without_dot_dot_still_create(tmp_path):
+    r = write_file(f"{tmp_path}/new/deeper/f.txt", "x")
+    assert (tmp_path / "new" / "deeper" / "f.txt").read_text() == "x"
+    assert "written_to" not in r

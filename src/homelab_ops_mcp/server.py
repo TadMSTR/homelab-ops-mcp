@@ -25,6 +25,7 @@ the command text. Pinned by test.
 import codecs
 import contextlib
 import difflib
+import errno
 import functools
 import logging
 import os
@@ -296,7 +297,15 @@ def _checked_resolve(path: Path) -> Path:
         try:
             st = os.lstat(candidate)
         except FileNotFoundError:
-            return Path(os.path.normpath(candidate.joinpath(*parts)))
+            # Nothing below a missing component can be a link, so the rest is
+            # joined as is. A ".." in it is refused, as the kernel would
+            # (ENOENT): collapsing it lexically would climb back into existing
+            # directories this walk never checked, links included.
+            if ".." in parts:
+                raise FileNotFoundError(
+                    errno.ENOENT, "a '..' follows a component that does not exist", str(path)
+                ) from None
+            return candidate.joinpath(*parts)
         if not stat.S_ISLNK(st.st_mode):
             resolved = candidate
             continue
@@ -756,9 +765,10 @@ def _read_lines_capped(path: Path, first: int, last: int | None, limit: int) -> 
                 pieces.append(text)
                 used += len(encoded)
                 # A line counts as returned only if some of it was: a budget
-                # that runs out exactly on a line boundary returns no part of
-                # the next one.
-                if room > 0:
+                # that runs out on a line boundary, or inside the line's first
+                # character, returns none of it, and a caller resuming at
+                # last + 1 must not skip it.
+                if text:
                     if returned_first is None:
                         returned_first = line_no
                     returned_last = line_no
@@ -771,6 +781,8 @@ def _read_lines_capped(path: Path, first: int, last: int | None, limit: int) -> 
         tail = decoder.decode(b"", final=True)  # a dangling partial sequence
         if tail and len(tail.encode()) <= limit - used:
             pieces.append(tail)
+        elif tail:
+            truncated = True  # left out, so say so
     total = (line_no if pending else line_no - 1) if complete else None
     return {
         "content": "".join(pieces),
