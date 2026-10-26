@@ -24,7 +24,7 @@ jobs:
     steps:
       # Actions are pinned to commit SHAs (not floating tags) per repo-standards —
       # a moved tag can't silently swap the action's code out from under CI.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # No token left in .git/config for later steps to read.
           persist-credentials: false
@@ -54,7 +54,7 @@ jobs:
     name: Test with [telemetry] (Python 3.13)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # No token left in .git/config for later steps to read.
           persist-credentials: false
@@ -85,7 +85,7 @@ jobs:
     name: Test against latest allowed versions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # No token left in .git/config for later steps to read.
           persist-credentials: false
@@ -118,7 +118,7 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # No token left in .git/config for later steps to read.
           persist-credentials: false
@@ -154,7 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # No token left in .git/config for later steps to read.
           persist-credentials: false
