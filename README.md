@@ -12,15 +12,20 @@ This server provides **unrestricted shell access** to the host machine. Any MCP 
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `run_command` | Execute a shell command (`bash -c`), returns stdout/stderr/exit_code |
-| `read_file` | Read a file by absolute path, optional `start_line`/`end_line` |
-| `read_multiple_files` | Read several files in one call; one failure does not fail the rest |
-| `write_file` | Write/overwrite a file, creates parent dirs by default |
-| `edit_file` | Find-and-replace edit — `old_str` must match exactly once; `dry_run` supported |
-| `read_directory` | List directory contents, optional recursive with `max_depth` |
-| `list_processes` | List running processes sorted by cpu/mem/pid, optional name filter |
+| Tool | Description | Key parameters | Returns |
+|------|-------------|----------------|---------|
+| `run_command` | Execute a shell command (`bash -c`) | `command`, `cwd` (default: home dir), `timeout` (seconds, default 30) | `stdout`, `stderr`, `exit_code`, `truncated`, `execution_time`, `error` (see [Output limits](#output-limits)) |
+| `read_file` | Read a file, optionally a line range | `path`, `start_line`, `end_line` | `path`, `content`, `total_lines` (`null` if the read stopped early), `truncated`; `returned_lines` when ranged or truncated |
+| `read_multiple_files` | Read several files in one call; one failure does not fail the rest | `paths` | `count`, `ok`, `failed`, `files` (a `read_file` result or an `error` per path) |
+| `write_file` | Write/overwrite a file atomically | `path`, `content`, `create_dirs` (default `true`) | `path`, `bytes_written`; `written_to` when the write went through a symlink |
+| `edit_file` | Find-and-replace edit — `old_str` must match exactly once | `path`, `old_str`, `new_str`, `dry_run` (default `false`) | `path`, `status`, `matches_replaced`, `dry_run`; `bytes_before`/`bytes_after` on a dry run; `line_endings`, `written_to` when they apply. No match: `error` plus the closest passage |
+| `read_directory` | List directory contents | `path`, `recursive` (default `false`), `max_depth` (default 2) | `path`, `count`, `entries` (`name`, `type`, `path`, `size_bytes`, `children`) |
+| `list_processes` | List running processes | `sort_by` (`cpu`/`mem`/`pid`, default `cpu`), `limit` (default 30), `name_filter` | `count`, `sort_by`, `processes` (`pid`, `name`, `cpu_percent`, `mem_percent`, `status`) |
+
+Paths must be absolute; `~` is not expanded. A tool that fails returns `{"error": "..."}`
+rather than raising. `read_directory` reports `type` as `dir` or `file` only, so a symlink
+to a file, a socket or a FIFO shows as `file`. `list_processes` measures CPU since its
+previous call, so the first call after the server starts reports `0.0` for every process.
 
 ## Tool annotations
 
@@ -78,6 +83,27 @@ namespace. Do this only on a trusted, isolated network, and be aware that a cont
 reaching the host via `host.docker.internal` bypasses any SSRF guard that blocks private
 IP ranges.
 
+## Environment variables
+
+None is required: every variable has a safe default, and the server runs with none set.
+Each one is described in the section linked.
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `SYSTEM_OPS_ALLOWED_HOSTS` | no | _(unset)_ | Extra accepted `Host` values ([Host and Origin check](#host-and-origin-check)) |
+| `SYSTEM_OPS_OUTPUT_LIMIT_BYTES` | no | `1048576` | `run_command` per-stream cap and the `read_file` budget ([Output limits](#output-limits)) |
+| `SYSTEM_OPS_CHILD_ENV_ENFORCE` | no | `false` | Restrict `run_command` children to the allowlist ([Child process environment](#child-process-environment)) |
+| `SYSTEM_OPS_CHILD_ENV_ALLOWLIST` | no | _(unset)_ | Extra variable names children may inherit |
+| `LOG_LEVEL` | no | `INFO` | Log level ([Logging](#logging)) |
+| `LOG_FILE` | no | _(unset)_ | Append logs here instead of stderr |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | _(unset)_ | OTLP gRPC collector ([Telemetry](#telemetry)) |
+| `OTEL_SERVICE_NAME` | no | `homelab-ops-mcp` | Service name reported to the collector |
+| `SYSTEM_OPS_INFLUXDB3_URL` / `_TOKEN` / `_DATABASE` | no | _(unset)_ / _(empty)_ / `homelab_ops_mcp` | InfluxDB 3 metrics sink |
+| `SYSTEM_OPS_NATS_URL` / `_SUBJECT` | no | _(unset)_ / `system.ops.mcp.metrics` | NATS metrics sink |
+
+Bind host, port and path are command-line flags, not environment variables (see
+[Running](#running)).
+
 ## Installation
 
 ```bash
@@ -86,6 +112,7 @@ uv sync --frozen --no-dev --no-editable --extra telemetry   # ... with telemetry
 pip install .                                     # ad hoc: re-resolves, so NOT the lock
 ```
 
+Requires Python 3.11 or later, and [uv](https://docs.astral.sh/uv/) for the locked install.
 This installs the `homelab_ops_mcp` package and a `homelab-ops-mcp` console script.
 CI tests and audits the versions in `uv.lock`; `pip install .` resolves the ranges in
 `pyproject.toml` afresh and can install something CI never saw.
@@ -96,16 +123,45 @@ CI tests and audits the versions in `uv.lock`; `pip install .` resolves the rang
 homelab-ops-mcp                          # default host 127.0.0.1 (loopback), port 8282
 homelab-ops-mcp --port 9090              # custom port
 homelab-ops-mcp --host 0.0.0.0           # expose to containers/LAN (unauthenticated — use with care)
+homelab-ops-mcp --path /mcp              # HTTP path (default /mcp)
 ```
 
 A backward-compatible `python server.py --host … --port …` shim is retained for
-existing deployments (it just calls the package entry point after an editable install).
+existing deployments. It imports the installed package, so it works with an editable or
+a non-editable install.
 
-With PM2:
+With PM2, run the venv's console script directly (`--interpreter none`, since it is not a
+Node.js script):
 ```bash
-pm2 start homelab-ops-mcp --name homelab-ops-mcp -- --port 8282
+pm2 start /path/to/homelab-ops-mcp/.venv/bin/homelab-ops-mcp --name homelab-ops-mcp \
+  --interpreter none -- --host 127.0.0.1 --port 8282
 pm2 save
 ```
+
+The repo's `ecosystem.config.js` is a worked example. It starts the server through
+`run-hardened.sh`, which sets `ulimit -c 0` (no core dumps on a crash, since PM2's fork
+mode has no ulimit option) and then execs the venv's Python. Adjust its paths to your
+checkout. Every setting has a safe default, so its `env` block declares only what that
+deployment sets differently.
+
+### Behind scoped-mcp
+
+To give agents per-agent, filtered access, proxy this server through
+[scoped-mcp](https://github.com/TadMSTR/scoped-mcp) as an `mcp_proxy` module. The proxy
+connects as `localhost:8282`, which the [Host check](#host-and-origin-check) accepts.
+`tool_denylist` hides tools from one agent, for example a reviewer that should not edit:
+
+```yaml
+modules:
+  system-ops:
+    type: mcp_proxy
+    config:
+      url: http://localhost:8282/mcp
+      tool_denylist:
+        - edit_file
+```
+
+Tools are exposed with the module name as prefix (`system-ops_run_command`).
 
 ### Telemetry
 
@@ -114,7 +170,7 @@ all, and every backend import is lazy and guarded, so an unset variable or a mis
 package degrades to a no-op rather than an error.
 
 ```bash
-pip install ".[telemetry]"
+uv sync --frozen --no-dev --no-editable --extra telemetry   # locked, as in Installation
 ```
 
 | Variable | Default | Purpose |
@@ -342,7 +398,9 @@ If LibreChat runs in a container (so the server is on a different host/namespace
 `http://host.docker.internal:8282/mcp` and start the server with `--host 0.0.0.0` — see the
 Transport section for the security caveats.
 
-### Claude Code (`.claude/claude_desktop_config.json` or MCP settings)
+### Claude Code (project `.mcp.json`)
+
+Or `claude mcp add --transport http homelab-ops http://localhost:8282/mcp`.
 
 ```json
 {
