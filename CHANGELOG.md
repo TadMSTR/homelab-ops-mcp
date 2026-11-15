@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.5.1] — 2026-11-15
+
+### Fixed
+
+- **`read_directory` is bounded and does not follow symlinks** (vikunja#1249). It had no entry
+  cap and no depth cap, so `read_directory("/", recursive=True, max_depth=50)` walked the whole
+  filesystem into one response. One call now returns at most 10,000 entries across all levels,
+  then stops with `truncated: true` and `truncated_at`. `max_depth` is clamped to 1-10 and
+  echoed back. `total_entries` counts every level. Entries are read with `lstat`: `type` is
+  `dir`, `file`, `symlink` (with `target`) or `other`, where symlinks, sockets and FIFOs all
+  used to read as `file`, and a symlink to a directory is no longer recursed into.
+- **`list_processes` samples CPU over a known interval** (vikunja#1250). psutil's first reading
+  for a process is always 0.0, so the first call after a restart sorted on all zeros, and later
+  calls averaged over the time since the previous call. Each call now primes every process,
+  waits 0.5 s and reads, and returns `cpu_sample_interval_s`. The call takes 0.5 s longer.
+
+### Changed
+
+- The release workflow's `actions/checkout` moves from v4.3.1 to the v7.0.1 SHA the other
+  workflows use, with `persist-credentials: false` (vikunja#1252).
+- `ecosystem.config.js` derives `script`, `cwd` and the log path instead of naming one host's
+  paths, and its comments no longer describe one host's logrotate rule and ports. The resolved
+  values are unchanged for a checkout that was already where the old literal paths pointed. The
+  `server.py` shim's docstring no longer says it needs an editable install (vikunja#1259).
+
+### Security
+
+- Dependency floors for two advisories: `dnspython>=2.9.2` (CVE-2026-128089, transitive) and,
+  in the `telemetry` extra, `opentelemetry-api>=1.45.2` (CVE-2026-126360). The lock moves
+  dnspython 2.9.0 → 2.9.2 and opentelemetry-api 1.45.1 → 1.45.2.
+
 ## [0.5.0] — 2026-10-25
 
 Behaviour changes worth reading before upgrading:

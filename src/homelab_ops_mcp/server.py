@@ -1167,6 +1167,23 @@ def _edit(p: Path, target: _Target, old_str: str, new_str: str, dry_run: bool) -
 # ---------------------------------------------------------------------------
 # read_directory
 # ---------------------------------------------------------------------------
+# Bounds for one listing (vikunja#1249). Without them read_directory("/", recursive=True,
+# max_depth=50) walked the whole filesystem into one response on the shared process.
+_DIR_MAX_ENTRIES = 10_000  # entries across every level of one call
+_DIR_MAX_DEPTH = 10
+
+
+def _entry_type(mode: int) -> str:
+    """dir / file / symlink / other, from an lstat mode: a link is never followed."""
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "other"
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def read_directory(
@@ -1176,10 +1193,17 @@ def read_directory(
 ) -> dict:
     """List contents of a directory.
 
+    Each entry's ``type`` is ``dir``, ``file``, ``symlink`` or ``other`` (socket, FIFO,
+    device), read with lstat. A symlink is reported with its ``target`` and is never
+    followed or recursed into. At most 10,000 entries are returned across all levels;
+    past that the walk stops, ``truncated`` is true and ``truncated_at`` names the
+    directory it stopped in. ``count`` is the top-level entry count, ``total_entries``
+    the count across all levels.
+
     Args:
         path: Absolute path to the directory.
         recursive: If True, recurse into subdirectories up to max_depth.
-        max_depth: Maximum recursion depth when recursive=True (default 2).
+        max_depth: Maximum recursion depth when recursive=True (default 2, clamped to 1-10).
     """
     try:
         p = _resolve_path(path)
@@ -1188,28 +1212,63 @@ def read_directory(
         if not p.is_dir():
             return {"error": f"Path is not a directory: {path}"}
 
+        depth_limit = max(1, min(max_depth, _DIR_MAX_DEPTH))
+        total = 0
+        truncated_at: str | None = None
+
         def _list(directory: Path, depth: int) -> list:
-            entries = []
+            nonlocal total, truncated_at
             try:
-                for item in sorted(directory.iterdir()):
-                    entry = {
-                        "name": item.name,
-                        "type": "dir" if item.is_dir() else "file",
-                        "path": str(item),
-                    }
-                    if item.is_file():
-                        with contextlib.suppress(Exception):
-                            entry["size_bytes"] = item.stat().st_size
-                    if recursive and item.is_dir() and depth < max_depth:
-                        entry["children"] = _list(item, depth + 1)
-                    entries.append(entry)
+                items = sorted(directory.iterdir())
             except PermissionError:
-                entries.append({"name": str(directory), "error": "permission denied"})
+                return [{"name": str(directory), "error": "permission denied"}]
+            entries = []
+            for item in items:
+                if total >= _DIR_MAX_ENTRIES:
+                    if truncated_at is None:
+                        truncated_at = str(directory)
+                    break
+                total += 1
+                entry: dict = {"name": item.name, "path": str(item)}
+                try:
+                    st = item.lstat()
+                except OSError:
+                    entry["type"] = "unknown"
+                    entries.append(entry)
+                    continue
+                kind = _entry_type(st.st_mode)
+                entry["type"] = kind
+                if kind == "file":
+                    entry["size_bytes"] = st.st_size
+                elif kind == "symlink":
+                    with contextlib.suppress(OSError):
+                        entry["target"] = os.readlink(item)
+                elif kind == "dir" and recursive and depth < depth_limit:
+                    entry["children"] = _list(item, depth + 1)
+                entries.append(entry)
             return entries
 
         entries = _list(p, 1)
-        log.info("read_directory.done", path=path, count=len(entries), recursive=recursive)
-        return {"path": path, "entries": entries, "count": len(entries)}
+        result: dict = {
+            "path": path,
+            "entries": entries,
+            "count": len(entries),
+            "total_entries": total,
+            "truncated": truncated_at is not None,
+        }
+        if truncated_at is not None:
+            result["truncated_at"] = truncated_at
+        if recursive:
+            result["max_depth"] = depth_limit
+        log.info(
+            "read_directory.done",
+            path=path,
+            count=len(entries),
+            total=total,
+            truncated=truncated_at is not None,
+            recursive=recursive,
+        )
+        return result
     except PathValidationError as e:
         log.warning("read_directory.invalid_path", path=path)
         return {"error": str(e)}
@@ -1221,6 +1280,12 @@ def read_directory(
 # ---------------------------------------------------------------------------
 # list_processes
 # ---------------------------------------------------------------------------
+# psutil's first cpu_percent() for a process is always 0.0, and later ones average over
+# the time since the previous call, however long ago (vikunja#1250). So every call primes
+# each process, waits this long, and reads: the figure is CPU over a known interval.
+_CPU_SAMPLE_S = 0.5
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": False})
 @_instrumented
 def list_processes(
@@ -1230,37 +1295,56 @@ def list_processes(
 ) -> dict:
     """List running processes with PID, name, CPU%, and memory%.
 
+    CPU% is measured over a fixed sampling interval (``cpu_sample_interval_s``, 0.5 s)
+    taken during the call, so the call takes at least that long.
+
     Args:
         sort_by: Sort field — "cpu", "mem", or "pid" (default "cpu").
         limit: Max number of processes to return (default 30).
         name_filter: Optional substring to filter process names (case-insensitive).
     """
     try:
-        procs = []
-        attrs = ["pid", "name", "cpu_percent", "memory_percent", "status"]
+        sampled = []
+        attrs = ["pid", "name", "memory_percent", "status"]
         for proc in psutil.process_iter(attrs):
             try:
                 info = proc.info
                 if name_filter and name_filter.lower() not in (info["name"] or "").lower():
                     continue
-                procs.append(
-                    {
-                        "pid": info["pid"],
-                        "name": info["name"],
-                        "cpu_percent": round(info["cpu_percent"] or 0.0, 2),
-                        "mem_percent": round(info["memory_percent"] or 0.0, 3),
-                        "status": info["status"],
-                    }
-                )
+                proc.cpu_percent(None)  # prime: starts this process's interval
+                sampled.append((proc, info))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+
+        time.sleep(_CPU_SAMPLE_S)
+
+        procs = []
+        for proc, info in sampled:
+            try:
+                cpu = proc.cpu_percent(None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            procs.append(
+                {
+                    "pid": info["pid"],
+                    "name": info["name"],
+                    "cpu_percent": round(cpu or 0.0, 2),
+                    "mem_percent": round(info["memory_percent"] or 0.0, 3),
+                    "status": info["status"],
+                }
+            )
 
         sort_key = {"cpu": "cpu_percent", "mem": "mem_percent", "pid": "pid"}.get(
             sort_by, "cpu_percent"
         )
         procs.sort(key=lambda x: x[sort_key], reverse=(sort_by != "pid"))
         log.debug("list_processes.done", count=len(procs[:limit]), sort_by=sort_by)
-        return {"count": len(procs[:limit]), "sort_by": sort_by, "processes": procs[:limit]}
+        return {
+            "count": len(procs[:limit]),
+            "sort_by": sort_by,
+            "cpu_sample_interval_s": _CPU_SAMPLE_S,
+            "processes": procs[:limit],
+        }
     except Exception as e:
         log.error("list_processes.error", error=str(e))
         return {"error": str(e)}

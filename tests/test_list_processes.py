@@ -44,3 +44,67 @@ def test_name_filter():
     # dropped everything would otherwise pass.
     assert r["processes"]
     assert all("python" in (p["name"] or "").lower() for p in r["processes"])
+
+
+def test_cpu_is_sampled_over_an_interval_on_the_first_call():
+    """vikunja#1250: a busy process ranks above an idle one on the very first call.
+
+    Both are fresh pids, so psutil has never sampled them: without priming and a wait,
+    both read 0.0 and the order between them is arbitrary.
+    """
+    import subprocess
+    import sys
+    import time
+
+    busy = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+    idle = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        time.sleep(0.2)
+        r = list_processes(sort_by="cpu", limit=100_000)
+    finally:
+        busy.kill()
+        idle.kill()
+        busy.wait()
+        idle.wait()
+    by_pid = {p["pid"]: p for p in r["processes"]}
+    assert by_pid[busy.pid]["cpu_percent"] > 20
+    assert by_pid[idle.pid]["cpu_percent"] < 5
+    assert r["cpu_sample_interval_s"] == 0.5
+
+
+def test_sampling_waits_the_reported_interval(monkeypatch):
+    from homelab_ops_mcp import server
+
+    slept = []
+    monkeypatch.setattr(server.time, "sleep", slept.append)
+    r = list_processes(limit=1)
+    assert slept == [0.5]
+    assert r["cpu_sample_interval_s"] == 0.5
+
+
+def test_process_that_exits_during_the_interval_is_skipped(monkeypatch):
+    from homelab_ops_mcp import server
+
+    class _Gone:
+        calls = 0
+
+        def __init__(self):
+            self.info = {"pid": 999_999, "name": "gone", "memory_percent": 0.0, "status": "running"}
+
+        def cpu_percent(self, interval=None):
+            _Gone.calls += 1
+            if _Gone.calls > 1:
+                raise server.psutil.NoSuchProcess(pid=999_999)
+            return 0.0
+
+    real_iter = server.psutil.process_iter
+
+    def _iter(attrs):
+        yield _Gone()
+        yield from real_iter(attrs)
+
+    monkeypatch.setattr(server.psutil, "process_iter", _iter)
+    monkeypatch.setattr(server.time, "sleep", lambda s: None)
+    r = list_processes(limit=100_000)
+    assert _Gone.calls == 2
+    assert 999_999 not in {p["pid"] for p in r["processes"]}
