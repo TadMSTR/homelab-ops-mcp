@@ -1195,10 +1195,14 @@ def read_directory(
 
     Each entry's ``type`` is ``dir``, ``file``, ``symlink`` or ``other`` (socket, FIFO,
     device), read with lstat. A symlink is reported with its ``target`` and is never
-    followed or recursed into. At most 10,000 entries are returned across all levels;
-    past that the walk stops, ``truncated`` is true and ``truncated_at`` names the
-    directory it stopped in. ``count`` is the top-level entry count, ``total_entries``
-    the count across all levels.
+    followed or recursed into. At most 10,000 entries are read across all levels; past
+    that the walk stops, ``truncated`` is true and ``truncated_at`` names the directory
+    it stopped in. A directory is read only up to the remaining budget, so entries are
+    sorted within what was read: a truncated directory's entries are not the first
+    10,000 by name. A subdirectory reached after the budget is spent has
+    ``truncated: true`` and no ``children``. A subdirectory that cannot be read has an
+    ``error`` entry; its siblings are still listed. ``count`` is the top-level entry
+    count, ``total_entries`` the count across all levels.
 
     Args:
         path: Absolute path to the directory.
@@ -1218,16 +1222,34 @@ def read_directory(
 
         def _list(directory: Path, depth: int) -> list:
             nonlocal total, truncated_at
+            # Read at most the remaining budget (plus one, to tell whether there was
+            # more), so a huge directory costs no more than the cap (F-01).
+            budget = _DIR_MAX_ENTRIES - total
+            names: list[str] = []
+            more = False
             try:
-                items = sorted(directory.iterdir())
+                with os.scandir(directory) as it:
+                    for de in it:
+                        if len(names) >= budget:
+                            more = True
+                            break
+                        names.append(de.name)
             except PermissionError:
                 return [{"name": str(directory), "error": "permission denied"}]
+            except OSError as e:
+                # Vanished, replaced by a file, I/O error: report this directory and
+                # keep the rest of the walk (F-02).
+                return [{"name": str(directory), "error": e.strerror or type(e).__name__}]
+            if more and truncated_at is None:
+                truncated_at = str(directory)
             entries = []
-            for item in items:
+            for name in sorted(names):
+                # Recursion into earlier siblings spends the same budget.
                 if total >= _DIR_MAX_ENTRIES:
                     if truncated_at is None:
                         truncated_at = str(directory)
                     break
+                item = directory / name
                 total += 1
                 entry: dict = {"name": item.name, "path": str(item)}
                 try:
@@ -1244,7 +1266,14 @@ def read_directory(
                     with contextlib.suppress(OSError):
                         entry["target"] = os.readlink(item)
                 elif kind == "dir" and recursive and depth < depth_limit:
-                    entry["children"] = _list(item, depth + 1)
+                    if total >= _DIR_MAX_ENTRIES:
+                        # Budget spent: don't read it, and don't return [] for it,
+                        # which would read as an empty directory.
+                        entry["truncated"] = True
+                        if truncated_at is None:
+                            truncated_at = str(item)
+                    else:
+                        entry["children"] = _list(item, depth + 1)
                 entries.append(entry)
             return entries
 

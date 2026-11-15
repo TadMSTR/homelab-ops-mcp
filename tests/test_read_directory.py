@@ -195,3 +195,121 @@ def test_lstat_failure_is_reported_as_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(server.Path, "lstat", _lstat)
     r = read_directory(str(tmp_path))
     assert r["entries"] == [{"name": "x", "path": str(tmp_path / "x"), "type": "unknown"}]
+
+
+# --- quickwins audit: bounded read, no empty children at the cap, OSError per directory ---
+
+
+def test_a_huge_directory_is_read_only_up_to_the_budget(tmp_path, monkeypatch):
+    from homelab_ops_mcp import server
+
+    monkeypatch.setattr(server, "_DIR_MAX_ENTRIES", 5)
+    for i in range(50):
+        (tmp_path / f"f{i:02}").touch()
+    pulled = []
+    real = server.os.scandir
+
+    class _Counting:
+        def __init__(self, it):
+            self._it = it
+
+        def __enter__(self):
+            self._it.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._it.__exit__(*a)
+
+        def __iter__(self):
+            for de in self._it:
+                pulled.append(de.name)
+                yield de
+
+    monkeypatch.setattr(server.os, "scandir", lambda p: _Counting(real(p)))
+    r = read_directory(str(tmp_path))
+    assert r["total_entries"] == 5
+    assert r["truncated"] is True
+    assert r["truncated_at"] == str(tmp_path)
+    # budget + 1 (to learn there was more), not all 50
+    assert len(pulled) == 6
+
+
+def test_a_subdirectory_reached_at_the_cap_is_marked_not_empty(tmp_path, monkeypatch):
+    from homelab_ops_mcp import server
+
+    monkeypatch.setattr(server, "_DIR_MAX_ENTRIES", 4)
+    for i in range(3):
+        (tmp_path / f"a{i}").touch()
+    zz = tmp_path / "zz"
+    zz.mkdir()
+    for i in range(5):
+        (zz / f"f{i}").touch()
+    calls = []
+    real = server.os.scandir
+    monkeypatch.setattr(server.os, "scandir", lambda p: calls.append(str(p)) or real(p))
+    r = read_directory(str(tmp_path), recursive=True)
+    by = {e["name"]: e for e in r["entries"]}
+    assert r["total_entries"] == 4
+    assert r["truncated"] is True
+    assert r["truncated_at"] == str(zz)
+    assert by["zz"]["truncated"] is True
+    assert "children" not in by["zz"]
+    assert str(zz) not in calls  # never read
+
+
+def _also_fail_iterdir(monkeypatch, server, scandir):
+    """Fail Path.iterdir the same way, so the test also fails on an iterdir-based walk."""
+    real = server.Path.iterdir
+
+    def _iterdir(self):
+        scandir(self).close()
+        return real(self)
+
+    monkeypatch.setattr(server.Path, "iterdir", _iterdir)
+
+
+def test_a_vanished_subdirectory_keeps_its_siblings(tmp_path, monkeypatch):
+    from homelab_ops_mcp import server
+
+    (tmp_path / "keep.txt").write_text("x")
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    (ok / "inner").touch()
+    real = server.os.scandir
+
+    def _scandir(p):
+        if str(p) == str(gone):
+            raise FileNotFoundError(2, "No such file or directory", str(p))
+        return real(p)
+
+    monkeypatch.setattr(server.os, "scandir", _scandir)
+    _also_fail_iterdir(monkeypatch, server, _scandir)
+    r = read_directory(str(tmp_path), recursive=True)
+    assert "error" not in r
+    by = {e["name"]: e for e in r["entries"]}
+    assert by["keep.txt"]["type"] == "file"
+    assert by["ok"]["children"][0]["name"] == "inner"
+    assert by["gone"]["children"] == [{"name": str(gone), "error": "No such file or directory"}]
+
+
+def test_a_subdirectory_replaced_by_a_file_keeps_its_siblings(tmp_path, monkeypatch):
+    from homelab_ops_mcp import server
+
+    (tmp_path / "keep.txt").write_text("x")
+    d = tmp_path / "d"
+    d.mkdir()
+    real = server.os.scandir
+
+    def _scandir(p):
+        if str(p) == str(d):
+            raise NotADirectoryError(20, "Not a directory", str(p))
+        return real(p)
+
+    monkeypatch.setattr(server.os, "scandir", _scandir)
+    _also_fail_iterdir(monkeypatch, server, _scandir)
+    r = read_directory(str(tmp_path), recursive=True)
+    by = {e["name"]: e for e in r["entries"]}
+    assert "keep.txt" in by
+    assert by["d"]["children"][0]["error"] == "Not a directory"
