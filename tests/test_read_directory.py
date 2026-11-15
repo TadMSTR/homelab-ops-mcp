@@ -294,6 +294,26 @@ def test_a_vanished_subdirectory_keeps_its_siblings(tmp_path, monkeypatch):
     assert by["gone"]["children"] == [{"name": str(gone), "error": "No such file or directory"}]
 
 
+def test_a_subdirectory_listing_error_is_logged(tmp_path, monkeypatch, recorder):
+    from homelab_ops_mcp import server
+
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    real = server.os.scandir
+
+    def _scandir(p):
+        if str(p) == str(gone):
+            raise FileNotFoundError(2, "No such file or directory", str(p))
+        return real(p)
+
+    monkeypatch.setattr(server.os, "scandir", _scandir)
+    _also_fail_iterdir(monkeypatch, server, _scandir)
+    read_directory(str(tmp_path), recursive=True)
+    (kw,) = recorder.of("read_directory.list_error")
+    assert kw["path"] == str(gone)
+    assert kw["error"] == "No such file or directory"
+
+
 def test_a_subdirectory_replaced_by_a_file_keeps_its_siblings(tmp_path, monkeypatch):
     from homelab_ops_mcp import server
 

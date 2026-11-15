@@ -1238,8 +1238,10 @@ def read_directory(
                 return [{"name": str(directory), "error": "permission denied"}]
             except OSError as e:
                 # Vanished, replaced by a file, I/O error: report this directory and
-                # keep the rest of the walk (F-02).
-                return [{"name": str(directory), "error": e.strerror or type(e).__name__}]
+                # keep the rest of the walk (F-02). Logged, since the call still succeeds.
+                reason = e.strerror or type(e).__name__
+                log.warning("read_directory.list_error", path=str(directory), error=reason)
+                return [{"name": str(directory), "error": reason}]
             if more and truncated_at is None:
                 truncated_at = str(directory)
             entries = []
