@@ -19,13 +19,18 @@ This server provides **unrestricted shell access** to the host machine. Any MCP 
 | `read_multiple_files` | Read several files in one call; one failure does not fail the rest | `paths` | `count`, `ok`, `failed`, `files` (a `read_file` result or an `error` per path) |
 | `write_file` | Write/overwrite a file atomically | `path`, `content`, `create_dirs` (default `true`) | `path`, `bytes_written`; `written_to` when the write went through a symlink |
 | `edit_file` | Find-and-replace edit — `old_str` must match exactly once | `path`, `old_str`, `new_str`, `dry_run` (default `false`) | `path`, `status`, `matches_replaced`, `dry_run`; `bytes_before`/`bytes_after` on a dry run; `line_endings`, `written_to` when they apply. No match: `error` plus the closest passage |
-| `read_directory` | List directory contents | `path`, `recursive` (default `false`), `max_depth` (default 2) | `path`, `count`, `entries` (`name`, `type`, `path`, `size_bytes`, `children`) |
-| `list_processes` | List running processes | `sort_by` (`cpu`/`mem`/`pid`, default `cpu`), `limit` (default 30), `name_filter` | `count`, `sort_by`, `processes` (`pid`, `name`, `cpu_percent`, `mem_percent`, `status`) |
+| `read_directory` | List directory contents | `path`, `recursive` (default `false`), `max_depth` (default 2, clamped to 1-10) | `path`, `count`, `total_entries`, `truncated`, `truncated_at` when truncated, `max_depth` when recursive, `entries` (`name`, `type`, `path`, `size_bytes`, `target`, `children`, `truncated`, `error`) |
+| `list_processes` | List running processes | `sort_by` (`cpu`/`mem`/`pid`, default `cpu`), `limit` (default 30), `name_filter` | `count`, `sort_by`, `cpu_sample_interval_s`, `processes` (`pid`, `name`, `cpu_percent`, `mem_percent`, `status`) |
 
 Paths must be absolute; `~` is not expanded. A tool that fails returns `{"error": "..."}`
-rather than raising. `read_directory` reports `type` as `dir` or `file` only, so a symlink
-to a file, a socket or a FIFO shows as `file`. `list_processes` measures CPU since its
-previous call, so the first call after the server starts reports `0.0` for every process.
+rather than raising. `read_directory` reads each entry with `lstat`: `type` is `dir`,
+`file`, `symlink` (with its `target`) or `other` (socket, FIFO, device), and a symlink is
+never followed or recursed into. One call returns at most 10,000 entries across all levels;
+past that it stops with `truncated: true` and `truncated_at`, the directory it stopped in. Each directory is read only up to the remaining budget, so entries are sorted within what
+was read. A subdirectory reached after the budget is spent has `truncated: true` and no
+`children`; one that cannot be listed has an `error` entry and its siblings are kept.
+`list_processes` measures CPU over a 0.5 s interval inside the call, so every call takes at
+least that long and the figures are comparable between calls.
 
 ## Tool annotations
 

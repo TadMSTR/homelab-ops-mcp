@@ -2,7 +2,8 @@
 
 The server now lives in the ``homelab_ops_mcp`` package under ``src/``. This shim
 preserves the historical ``python server.py --host ... --port ...`` invocation
-(used by ecosystem.config.js) after an editable install (``pip install -e .``).
+(used by run-hardened.sh). It imports the installed package, so it works after an
+editable or a non-editable install (``uv sync --frozen --no-dev --no-editable``).
 Prefer the ``homelab-ops-mcp`` console script for new deployments.
 """
 

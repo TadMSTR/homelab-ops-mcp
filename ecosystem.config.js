@@ -1,12 +1,19 @@
+// Paths are derived, not written out: the checkout is wherever this file is, and logs go
+// to ~/logs. Adjust LOG_FILE if your host keeps logs elsewhere.
+const os = require("os");
+const path = require("path");
+
+const LOG_FILE = path.join(os.homedir(), "logs", "system-ops.log");
+
 module.exports = {
   apps: [
     {
       name: "system-ops",
       // run-hardened.sh sets `ulimit -c 0` before exec'ing the venv python3 server —
       // PM2 fork_mode has no native ulimit option (HLOPS-1 audit LOW: no core dumps on crash).
-      script: "/home/ted/repos/personal/homelab-ops-mcp/run-hardened.sh",
+      script: path.join(__dirname, "run-hardened.sh"),
       args: ["--host", "127.0.0.1", "--port", "8282"],
-      cwd: "/home/ted/repos/personal/homelab-ops-mcp",
+      cwd: __dirname,
       interpreter: "none",
 
       // Declared explicitly, and deliberately minimal.
@@ -45,33 +52,29 @@ module.exports = {
         // set, the server writes its own JSON stream to this file and stderr
         // carries nothing, so there is one writer and one format.
         //
-        // Deliberately the same path as out_file/error_file below: the file is
-        // already covered by /etc/logrotate.d/forge-logs
-        // (/home/ted/logs/[!b]*.log, daily, rotate 14, copytruncate), and a
-        // second path would need a second logrotate claim. The handle is opened
+        // Deliberately the same path as out_file/error_file below: one file means
+        // one logrotate rule (use copytruncate), and a second path would need a
+        // second logrotate claim. The handle is opened
         // in append mode, which is what makes copytruncate safe — writes resume
         // at the new end of file rather than leaving a sparse gap.
         //
         // Do NOT add pm2-logrotate. It is not installed, and a second mechanism
         // would double-claim these files, which logrotate treats as a hard
         // error that fails the whole daily run.
-        LOG_FILE: "/home/ted/logs/system-ops.log",
+        LOG_FILE,
 
         // Telemetry. Only OTLP is enabled; the InfluxDB and NATS sinks stay
         // unset, so telemetry.py never starts its background loop thread.
         //
-        // 127.0.0.1:4317 is the SigNoz collector's gRPC port. Taken from
-        // dockhand-mcp, another host-side PM2 MCP server, which uses this exact
-        // endpoint and does appear in SigNoz — so it is proven from this
-        // deployment shape rather than merely reachable.
+        // 127.0.0.1:4317 is the conventional OTLP gRPC port of a collector on
+        // the same host. Point it at yours, or delete the line to turn OTLP off.
         //
-        // Not INFLUXDB_URL from forge.env: that name holds a container-network
-        // address host processes cannot resolve, and port 8181 on this host is
-        // qmd. See vikunja#575.
+        // If you also set INFLUXDB_URL, use an address this host process can
+        // resolve: a container-network name that works inside Docker will not.
         OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:4317",
-        // The PM2 app name, so the service is findable in SigNoz under the name
-        // an operator already uses for it. The package default is
-        // "homelab-ops-mcp".
+        // The PM2 app name, so the service is findable in your tracing backend
+        // under the name an operator already uses for it. The package default
+        // is "homelab-ops-mcp".
         OTEL_SERVICE_NAME: "system-ops",
       },
 
@@ -79,8 +82,8 @@ module.exports = {
       max_restarts: 10,
       min_uptime: "10s",
 
-      out_file: "/home/ted/logs/system-ops.log",
-      error_file: "/home/ted/logs/system-ops.log",
+      out_file: LOG_FILE,
+      error_file: LOG_FILE,
       merge_logs: true,
       time: true,
     },

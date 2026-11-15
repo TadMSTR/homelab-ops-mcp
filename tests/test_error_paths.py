@@ -63,7 +63,7 @@ def test_edit_file_generic_error(monkeypatch, sample_file):
 
 # --- read_directory ----------------------------------------------------------
 def test_read_directory_inner_permission_denied(monkeypatch, tmp_path):
-    monkeypatch.setattr(server.Path, "iterdir", _raise(PermissionError()))
+    monkeypatch.setattr(server.os, "scandir", _raise(PermissionError()))
     r = read_directory(str(tmp_path))
     # Inner PermissionError is caught and reported as an entry, not top-level error.
     assert r["entries"][0]["error"] == "permission denied"
