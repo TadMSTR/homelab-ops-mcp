@@ -38,11 +38,21 @@ def test_unknown_sort_falls_back_to_cpu():
 
 
 def test_name_filter():
-    # The test runner itself is a python process; filter should match it.
-    r = list_processes(name_filter="python", limit=100)
+    # A python child that outlives the 0.5 s sampling interval. The runner itself is no
+    # match: under `uv run pytest` its process name is "pytest", and transient python
+    # processes may exit mid-interval and be dropped.
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        r = list_processes(name_filter="python", limit=100_000)
+    finally:
+        child.kill()
+        child.wait()
     # Non-empty first: all() over an empty list is True, so a filter that
     # dropped everything would otherwise pass.
-    assert r["processes"]
+    assert child.pid in {p["pid"] for p in r["processes"]}
     assert all("python" in (p["name"] or "").lower() for p in r["processes"])
 
 
