@@ -10,7 +10,12 @@
   then stops with `truncated: true` and `truncated_at`. `max_depth` is clamped to 1-10 and
   echoed back. `total_entries` counts every level. Entries are read with `lstat`: `type` is
   `dir`, `file`, `symlink` (with `target`) or `other`, where symlinks, sockets and FIFOs all
-  used to read as `file`, and a symlink to a directory is no longer recursed into.
+  used to read as `file`, and a symlink to a directory is no longer recursed into. Each
+  directory is read only up to the remaining budget, so a directory with millions of entries
+  costs no more than the cap; entries are sorted within what was read. A subdirectory reached
+  once the budget is spent has `truncated: true` and no `children`, instead of an empty list.
+  A subdirectory that vanishes or cannot be listed mid-walk gets an `error` entry; before, any
+  error other than permission replaced the whole listing with one error.
 - **`list_processes` samples CPU over a known interval** (vikunja#1250). psutil's first reading
   for a process is always 0.0, so the first call after a restart sorted on all zeros, and later
   calls averaged over the time since the previous call. Each call now primes every process,
@@ -27,9 +32,10 @@
 
 ### Security
 
-- Dependency floors for two advisories: `dnspython>=2.9.2` (CVE-2026-128089, transitive) and,
-  in the `telemetry` extra, `opentelemetry-api>=1.45.2` (CVE-2026-126360). The lock moves
-  dnspython 2.9.0 → 2.9.2 and opentelemetry-api 1.45.1 → 1.45.2.
+- Dependency floors for two advisories: `dnspython>=2.9.2` (CVE-2026-128089) and
+  `opentelemetry-api>=1.45.2` (CVE-2026-126360), both transitive and both in base
+  dependencies, since fastmcp installs opentelemetry-api with or without `[telemetry]`. The
+  lock moves dnspython 2.9.0 → 2.9.2 and opentelemetry-api 1.45.1 → 1.45.2.
 
 ## [0.5.0] — 2026-10-25
 

@@ -30,6 +30,10 @@ dependencies = [
     # dnspython is transitive (fastmcp -> pydantic email-validator); declared only to
     # hold it above CVE-2026-128089 (fixed in 2.9.2, 2026-11-15).
     "dnspython>=2.9.2",
+    # opentelemetry-api is transitive too (fastmcp-slim[server]), so every install has it,
+    # with or without [telemetry]. The floor sits here so a re-resolve into an existing
+    # venv lifts it above CVE-2026-126360 (fixed in 1.45.2, 2026-11-15).
+    "opentelemetry-api>=1.45.2",
     "psutil>=6.0",
     "structlog>=24.0",
 ]
@@ -39,7 +43,7 @@ dependencies = [
 # no telemetry libraries present. Every import in telemetry.py is lazy and
 # guarded, so a missing package degrades to a no-op rather than a crash.
 telemetry = [
-    # 1.45.2: CVE-2026-126360 (2026-11-15).
+    # The opentelemetry-api floor is in base dependencies: fastmcp pulls it in anyway.
     "opentelemetry-api>=1.45.2",
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp-proto-grpc>=1.25",
